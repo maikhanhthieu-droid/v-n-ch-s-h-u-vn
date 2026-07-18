@@ -9,6 +9,8 @@ Commands:
     /help
     /quote <TICKER>
     /report <TICKER>
+    /chart <TICKER>
+    /ta <TICKER>
     /market
     /add <TICKER>
     /remove <TICKER>
@@ -80,6 +82,17 @@ class Quote:
         return (self.price / self.previous_close - 1.0) * 100.0
 
 
+@dataclass(frozen=True)
+class PriceBar:
+    """Daily market data used for simple chart and technical summaries."""
+
+    close: float
+    high: float | None = None
+    low: float | None = None
+    open_price: float | None = None
+    volume: int | None = None
+
+
 def normalize_symbol(raw: str) -> str:
     """Validate and normalize a Vietnamese ticker supplied by a user."""
 
@@ -139,6 +152,7 @@ class YahooQuoteProvider:
         self.timeout = timeout
         self.cache_ttl = cache_ttl
         self._cache: dict[str, tuple[float, Quote]] = {}
+        self._history_cache: dict[tuple[str, str, str], tuple[float, list[PriceBar]]] = {}
 
     def get_quote(self, symbol: str) -> Quote:
         normalized = symbol.upper()
@@ -192,6 +206,49 @@ class YahooQuoteProvider:
         self._cache[normalized] = (now, quote)
         return quote
 
+    def get_history(self, symbol: str, range_value: str = "6mo", interval: str = "1d") -> list[PriceBar]:
+        normalized = symbol.upper()
+        cache_key = (normalized, range_value, interval)
+        cached = self._history_cache.get(cache_key)
+        now = time.monotonic()
+        if cached and now - cached[0] < self.cache_ttl:
+            return cached[1]
+
+        yahoo = yahoo_symbol(normalized)
+        endpoint = (
+            "https://query1.finance.yahoo.com/v8/finance/chart/"
+            f"{url_quote(yahoo, safe='')}"
+            f"?range={url_quote(range_value)}&interval={url_quote(interval)}&includePrePost=false"
+        )
+        payload = _json_request(endpoint, self.timeout)
+        try:
+            result = payload["chart"]["result"][0]
+            quote_data = result["indicators"]["quote"][0]
+            closes = quote_data.get("close", [])
+            highs = quote_data.get("high", [])
+            lows = quote_data.get("low", [])
+            opens = quote_data.get("open", [])
+            volumes = quote_data.get("volume", [])
+            bars: list[PriceBar] = []
+            for index, close in enumerate(closes):
+                if close is None:
+                    continue
+                bars.append(
+                    PriceBar(
+                        close=float(close),
+                        high=float(highs[index]) if index < len(highs) and highs[index] is not None else None,
+                        low=float(lows[index]) if index < len(lows) and lows[index] is not None else None,
+                        open_price=float(opens[index]) if index < len(opens) and opens[index] is not None else None,
+                        volume=int(volumes[index]) if index < len(volumes) and volumes[index] is not None else None,
+                    )
+                )
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise BotError(f"Chưa có dữ liệu lịch sử cho mã {normalized}.") from exc
+        if len(bars) < 2:
+            raise BotError(f"Chưa đủ dữ liệu lịch sử cho mã {normalized}.")
+        self._history_cache[cache_key] = (now, bars)
+        return bars
+
 
 def format_number(value: float | None, decimals: int = 2) -> str:
     if value is None:
@@ -241,6 +298,103 @@ def format_report(quote: Quote) -> str:
         f"Thấp nhất phiên: {format_number(quote.day_low)}\n"
         f"Khối lượng: {format_number(float(quote.volume), 0) if quote.volume is not None else '—'}\n\n"
         "<i>Dữ liệu từ Yahoo Finance, chỉ để tham khảo.</i>"
+    )
+
+
+def moving_average(values: list[float], window: int) -> float | None:
+    if len(values) < window:
+        return None
+    return sum(values[-window:]) / window
+
+
+def rsi(values: list[float], window: int = 14) -> float | None:
+    if len(values) <= window:
+        return None
+    gains: list[float] = []
+    losses: list[float] = []
+    for previous, current in zip(values[-window - 1 : -1], values[-window:]):
+        change = current - previous
+        if change >= 0:
+            gains.append(change)
+            losses.append(0.0)
+        else:
+            gains.append(0.0)
+            losses.append(abs(change))
+    average_gain = sum(gains) / window
+    average_loss = sum(losses) / window
+    if average_loss == 0:
+        return 100.0
+    rs = average_gain / average_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def sparkline(values: list[float], width: int = 30) -> str:
+    points = values[-width:]
+    if not points:
+        return ""
+    ticks = "▁▂▃▄▅▆▇█"
+    low = min(points)
+    high = max(points)
+    if high == low:
+        return ticks[0] * len(points)
+    return "".join(ticks[round((value - low) / (high - low) * (len(ticks) - 1))] for value in points)
+
+
+def format_chart(symbol: str, bars: list[PriceBar]) -> str:
+    closes = [bar.close for bar in bars]
+    recent = closes[-30:]
+    current = recent[-1]
+    low = min(recent)
+    high = max(recent)
+    change = current - recent[0]
+    change_pct = (current / recent[0] - 1.0) * 100.0 if recent[0] else 0.0
+    sign = "+" if change >= 0 else ""
+    return (
+        f"<b>Chart nhanh: {html.escape(symbol)}</b>\n"
+        f"<pre>{html.escape(sparkline(closes))}</pre>\n"
+        f"30 phiên: {format_number(low)} → {format_number(high)}\n"
+        f"Hiện tại: <b>{format_number(current)}</b>\n"
+        f"Biến động 30 phiên: <b>{sign}{format_number(change)}</b> ({sign}{change_pct:.2f}%)\n\n"
+        "<i>Biểu đồ chữ để xem nhanh trong Telegram.</i>"
+    )
+
+
+def format_ta(symbol: str, bars: list[PriceBar]) -> str:
+    closes = [bar.close for bar in bars]
+    current = closes[-1]
+    ma5 = moving_average(closes, 5)
+    ma20 = moving_average(closes, 20)
+    rsi14 = rsi(closes, 14)
+    recent = bars[-20:]
+    support_values = [bar.low for bar in recent if bar.low is not None]
+    resistance_values = [bar.high for bar in recent if bar.high is not None]
+    support = min(support_values) if support_values else min(closes[-20:])
+    resistance = max(resistance_values) if resistance_values else max(closes[-20:])
+
+    if ma5 is not None and ma20 is not None:
+        trend = "ngắn hạn tích cực" if ma5 >= ma20 else "ngắn hạn yếu hơn"
+    else:
+        trend = "chưa đủ dữ liệu"
+
+    if rsi14 is None:
+        rsi_note = "chưa đủ dữ liệu"
+    elif rsi14 >= 70:
+        rsi_note = "RSI cao, có thể đang nóng"
+    elif rsi14 <= 30:
+        rsi_note = "RSI thấp, có thể đang quá bán"
+    else:
+        rsi_note = "RSI trung tính"
+
+    return (
+        f"<b>TA nhanh: {html.escape(symbol)}</b>\n"
+        f"Giá: <b>{format_number(current)}</b>\n"
+        f"MA5: {format_number(ma5)}\n"
+        f"MA20: {format_number(ma20)}\n"
+        f"RSI14: {format_number(rsi14)} — {html.escape(rsi_note)}\n"
+        f"Hỗ trợ gần: {format_number(support)}\n"
+        f"Kháng cự gần: {format_number(resistance)}\n"
+        f"Nhận xét: {html.escape(trend)}.\n\n"
+        "<i>Chỉ là thống kê kỹ thuật tự động, không phải khuyến nghị mua/bán.</i>"
     )
 
 
@@ -390,6 +544,8 @@ HELP = (
     "<b>Các lệnh</b>\n"
     "/quote <code>FPT</code> — giá và thay đổi gần nhất\n"
     "/report <code>FPT</code> — báo cáo nhanh: giá, cao/thấp, khối lượng\n"
+    "/chart <code>FPT</code> — biểu đồ chữ 30 phiên\n"
+    "/ta <code>FPT</code> — MA5, MA20, RSI14, hỗ trợ/kháng cự\n"
     "/market — VN-Index\n"
     "/add <code>FPT</code> — thêm vào danh sách theo dõi\n"
     "/remove <code>FPT</code> — xóa khỏi danh sách\n"
@@ -456,6 +612,18 @@ class BotApplication:
                     return "Dùng: /report <mã>, ví dụ /report FPT"
                 symbol = normalize_symbol(argument.split()[0])
                 return format_report(self.provider.get_quote(symbol))
+            if command == "/chart":
+                argument = _argument(text)
+                if not argument:
+                    return "Dùng: /chart <mã>, ví dụ /chart FPT"
+                symbol = normalize_symbol(argument.split()[0])
+                return format_chart(symbol, self.provider.get_history(symbol))
+            if command == "/ta":
+                argument = _argument(text)
+                if not argument:
+                    return "Dùng: /ta <mã>, ví dụ /ta FPT"
+                symbol = normalize_symbol(argument.split()[0])
+                return format_ta(symbol, self.provider.get_history(symbol))
             if command == "/market":
                 return format_quote(self.provider.get_quote("VNINDEX"))
             if command == "/add":
