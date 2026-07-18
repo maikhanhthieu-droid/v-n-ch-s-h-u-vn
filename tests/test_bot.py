@@ -11,10 +11,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bot import (  # noqa: E402
     BotApplication,
     BotError,
+    PriceBar,
     Quote,
     WatchlistStore,
+    format_chart,
     format_quote,
     format_report,
+    format_ta,
     normalize_symbol,
     yahoo_symbol,
 )
@@ -36,6 +39,19 @@ class FakeProvider:
             day_low=97.0,
             volume=123456,
         )
+
+    def get_history(self, symbol):
+        self.calls.append(f"history:{symbol}")
+        return [
+            PriceBar(
+                close=90.0 + index,
+                high=91.0 + index,
+                low=89.0 + index,
+                open_price=89.5 + index,
+                volume=1000 + index,
+            )
+            for index in range(30)
+        ]
 
 
 class BotTests(unittest.TestCase):
@@ -59,6 +75,13 @@ class BotTests(unittest.TestCase):
         rendered = format_report(quote)
         self.assertIn("Báo cáo nhanh", rendered)
         self.assertIn("123,456", rendered)
+
+    def test_chart_and_ta_formatters(self):
+        bars = [PriceBar(close=100.0 + index, high=101.0 + index, low=99.0 + index) for index in range(30)]
+        self.assertIn("Chart nhanh", format_chart("FPT", bars))
+        rendered_ta = format_ta("FPT", bars)
+        self.assertIn("TA nhanh", rendered_ta)
+        self.assertIn("RSI14", rendered_ta)
 
     def test_watchlist_is_persisted(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -85,7 +108,9 @@ class BotTests(unittest.TestCase):
             self.assertIn("100.00", app.handle_text("/quote FPT", 1))
             self.assertIn("100.00", app.handle_text("FPT", 1))
             self.assertIn("123,456", app.handle_text("/report FPT", 1))
-            self.assertEqual(provider.calls, ["FPT", "FPT", "FPT"])
+            self.assertIn("Chart nhanh", app.handle_text("/chart FPT", 1))
+            self.assertIn("TA nhanh", app.handle_text("/ta FPT", 1))
+            self.assertEqual(provider.calls, ["FPT", "FPT", "FPT", "history:FPT", "history:FPT"])
             app.handle_update(
                 {"update_id": 1, "message": {"chat": {"id": 1}, "text": "/ping"}}
             )
