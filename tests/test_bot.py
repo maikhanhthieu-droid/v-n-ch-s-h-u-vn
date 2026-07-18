@@ -11,9 +11,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bot import (  # noqa: E402
     BotApplication,
     BotError,
+    FundamentalSnapshot,
     PriceBar,
     Quote,
+    SignalStore,
     WatchlistStore,
+    score_candidate,
     format_chart,
     format_quote,
     format_report,
@@ -83,6 +86,21 @@ class BotTests(unittest.TestCase):
         self.assertIn("TA nhanh", rendered_ta)
         self.assertIn("RSI14", rendered_ta)
 
+    def test_deep_signal_score_rewards_discount_and_low_valuation(self):
+        quote = Quote("FPT", "FPT Company", 70.0, 72.0)
+        snapshot = FundamentalSnapshot(
+            symbol="FPT",
+            name="FPT Company",
+            price=70.0,
+            trailing_pe=9.0,
+            price_to_book=1.1,
+            fifty_two_week_high=110.0,
+        )
+        bars = [PriceBar(close=90.0 - index, high=91.0 - index, low=89.0 - index) for index in range(30)]
+        score, reasons = score_candidate(snapshot, quote, bars)
+        self.assertGreaterEqual(score, 70)
+        self.assertTrue(reasons)
+
     def test_watchlist_is_persisted(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "watchlists.json"
@@ -101,6 +119,7 @@ class BotTests(unittest.TestCase):
                 telegram=telegram,
                 provider=provider,
                 store=WatchlistStore(Path(directory) / "watchlists.json"),
+                signal_store=SignalStore(Path(directory) / "signals.json"),
             )
             self.assertIn("VN Equity Bot", app.handle_text("/start", 1))
             self.assertIn("FPT", app.handle_text("/add FPT", 1))
@@ -110,6 +129,8 @@ class BotTests(unittest.TestCase):
             self.assertIn("123,456", app.handle_text("/report FPT", 1))
             self.assertIn("Chart nhanh", app.handle_text("/chart FPT", 1))
             self.assertIn("TA nhanh", app.handle_text("/ta FPT", 1))
+            self.assertIn("Đã bật", app.handle_text("/signals_on", 1))
+            self.assertIn("đang bật", app.handle_text("/signals_status", 1))
             self.assertEqual(provider.calls, ["FPT", "FPT", "FPT", "history:FPT", "history:FPT"])
             app.handle_update(
                 {"update_id": 1, "message": {"chat": {"id": 1}, "text": "/ping"}}
