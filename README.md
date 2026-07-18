@@ -35,6 +35,12 @@ không khả dụng; bot không đưa ra khuyến nghị đầu tư.
    Bot dùng long polling, nên cửa sổ/process phải luôn chạy. Gửi `/start` cho bot
    trên Telegram rồi thử `/quote FPT`.
 
+   Hoặc nhập token bằng ô ẩn, không lưu token vào file:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\run_bot.ps1
+   ```
+
 Các biến tùy chọn: `POLL_TIMEOUT`, `YAHOO_TIMEOUT`, `DATA_DIR`, `LOG_LEVEL`.
 
 ## Kiểm thử
@@ -54,4 +60,3 @@ phù hợp để giữ long polling liên tục.
 
 Đây là nền tảng MVP. Có thể bổ sung dữ liệu tài chính, định giá, tin tức và báo cáo
 định kỳ sau khi thống nhất nguồn dữ liệu và các lệnh cần thiết.
-
