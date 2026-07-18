@@ -14,6 +14,7 @@ from bot import (  # noqa: E402
     Quote,
     WatchlistStore,
     format_quote,
+    format_report,
     normalize_symbol,
     yahoo_symbol,
 )
@@ -30,6 +31,10 @@ class FakeProvider:
             name=f"{symbol} Company",
             price=100.0,
             previous_close=95.0,
+            open_price=98.0,
+            day_high=101.0,
+            day_low=97.0,
+            volume=123456,
         )
 
 
@@ -48,6 +53,12 @@ class BotTests(unittest.TestCase):
         rendered = format_quote(quote)
         self.assertIn("&lt;unsafe&gt;", rendered)
         self.assertIn("+5.26%", rendered)
+
+    def test_format_report_includes_session_data(self):
+        quote = Quote("FPT", "FPT Company", 100, 95, open_price=98, day_high=101, day_low=97, volume=123456)
+        rendered = format_report(quote)
+        self.assertIn("Báo cáo nhanh", rendered)
+        self.assertIn("123,456", rendered)
 
     def test_watchlist_is_persisted(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -72,7 +83,9 @@ class BotTests(unittest.TestCase):
             self.assertIn("FPT", app.handle_text("/add FPT", 1))
             self.assertIn("FPT", app.handle_text("/watchlist", 1))
             self.assertIn("100.00", app.handle_text("/quote FPT", 1))
-            self.assertEqual(provider.calls, ["FPT"])
+            self.assertIn("100.00", app.handle_text("FPT", 1))
+            self.assertIn("123,456", app.handle_text("/report FPT", 1))
+            self.assertEqual(provider.calls, ["FPT", "FPT", "FPT"])
             app.handle_update(
                 {"update_id": 1, "message": {"chat": {"id": 1}, "text": "/ping"}}
             )
