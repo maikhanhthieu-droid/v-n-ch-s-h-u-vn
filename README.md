@@ -8,6 +8,8 @@ Repo gốc hiện chỉ có README; bản này là một MVP có thể chạy đ
 
 - `/start`, `/help`, `/ping`
 - `/quote FPT`: giá gần nhất và phần trăm thay đổi
+- Gõ trực tiếp `FPT` hoặc `VNM` để tra giá nhanh không cần lệnh
+- `/report FPT`: báo cáo nhanh gồm giá, mở cửa, cao/thấp phiên và khối lượng
 - `/market`: VN-Index
 - `/add FPT`, `/remove FPT`: quản lý danh sách theo dõi theo từng cuộc trò chuyện
 - `/watchlist`, `/watch`: xem và lấy giá danh sách theo dõi
@@ -33,7 +35,7 @@ không khả dụng; bot không đưa ra khuyến nghị đầu tư.
    ```
 
    Bot dùng long polling, nên cửa sổ/process phải luôn chạy. Gửi `/start` cho bot
-   trên Telegram rồi thử `/quote FPT`.
+   trên Telegram rồi thử `FPT`, `/quote FPT` hoặc `/report FPT`.
 
    Hoặc nhập token bằng ô ẩn, không lưu token vào file:
 
