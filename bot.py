@@ -8,6 +8,7 @@ Commands:
     /start
     /help
     /quote <TICKER>
+    /report <TICKER>
     /market
     /add <TICKER>
     /remove <TICKER>
@@ -61,6 +62,10 @@ class Quote:
     previous_close: float | None
     currency: str = "VND"
     as_of: str | None = None
+    open_price: float | None = None
+    day_high: float | None = None
+    day_low: float | None = None
+    volume: int | None = None
 
     @property
     def change(self) -> float | None:
@@ -164,6 +169,11 @@ class YahooQuoteProvider:
                 or meta.get("chartPreviousClose")
                 or meta.get("regularMarketPreviousClose")
             )
+            quote_data = result["indicators"]["quote"][0]
+            highs = [x for x in quote_data.get("high", []) if x is not None]
+            lows = [x for x in quote_data.get("low", []) if x is not None]
+            opens = [x for x in quote_data.get("open", []) if x is not None]
+            volumes = [x for x in quote_data.get("volume", []) if x is not None]
             display_symbol = "VN-Index" if normalized == "VNINDEX" else normalized
             quote = Quote(
                 symbol=normalized,
@@ -172,6 +182,10 @@ class YahooQuoteProvider:
                 previous_close=float(previous) if previous is not None else None,
                 currency=str(meta.get("currency") or "VND"),
                 as_of=str(meta.get("regularMarketTime") or "") or None,
+                open_price=float(opens[-1]) if opens else None,
+                day_high=float(highs[-1]) if highs else None,
+                day_low=float(lows[-1]) if lows else None,
+                volume=int(volumes[-1]) if volumes else None,
             )
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise BotError(f"Chưa có dữ liệu cho mã {normalized}.") from exc
@@ -202,7 +216,31 @@ def format_quote(quote: Quote) -> str:
         f"<b>{html.escape(quote.symbol)}</b> — {html.escape(quote.name)}\n"
         f"Giá: <b>{format_number(quote.price)}</b> {html.escape(quote.currency)}\n"
         f"{change_line}\n"
-        "<i>Dữ liệu tham khảo, có thể trễ hoặc thiếu.</i>"
+        "<i>Gõ /report "
+        f"{html.escape(quote.symbol)} để xem thêm. Dữ liệu tham khảo, có thể trễ hoặc thiếu.</i>"
+    )
+
+
+def format_report(quote: Quote) -> str:
+    """Render a richer single-symbol snapshot."""
+
+    change = quote.change
+    change_pct = quote.change_pct
+    if change is None or change_pct is None:
+        change_text = "—"
+    else:
+        sign = "+" if change >= 0 else ""
+        change_text = f"{sign}{format_number(change)} ({sign}{change_pct:.2f}%)"
+    return (
+        f"<b>Báo cáo nhanh: {html.escape(quote.symbol)}</b>\n"
+        f"{html.escape(quote.name)}\n\n"
+        f"Giá hiện tại: <b>{format_number(quote.price)}</b> {html.escape(quote.currency)}\n"
+        f"Thay đổi: <b>{change_text}</b>\n"
+        f"Mở cửa: {format_number(quote.open_price)}\n"
+        f"Cao nhất phiên: {format_number(quote.day_high)}\n"
+        f"Thấp nhất phiên: {format_number(quote.day_low)}\n"
+        f"Khối lượng: {format_number(float(quote.volume), 0) if quote.volume is not None else '—'}\n\n"
+        "<i>Dữ liệu từ Yahoo Finance, chỉ để tham khảo.</i>"
     )
 
 
@@ -351,13 +389,15 @@ WELCOME = (
 HELP = (
     "<b>Các lệnh</b>\n"
     "/quote <code>FPT</code> — giá và thay đổi gần nhất\n"
+    "/report <code>FPT</code> — báo cáo nhanh: giá, cao/thấp, khối lượng\n"
     "/market — VN-Index\n"
     "/add <code>FPT</code> — thêm vào danh sách theo dõi\n"
     "/remove <code>FPT</code> — xóa khỏi danh sách\n"
     "/watchlist — xem danh sách đã lưu\n"
     "/watch — lấy giá toàn bộ danh sách\n"
     "/ping — kiểm tra bot\n\n"
-    "Ví dụ: <code>/quote VNM</code>"
+    "Ví dụ: <code>/quote VNM</code>\n"
+    "Bạn cũng có thể gõ trực tiếp <code>FPT</code> hoặc <code>VNM</code>."
 )
 
 
@@ -410,6 +450,12 @@ class BotApplication:
                     return "Dùng: /quote <mã>, ví dụ /quote FPT"
                 symbol = normalize_symbol(argument.split()[0])
                 return format_quote(self.provider.get_quote(symbol))
+            if command == "/report":
+                argument = _argument(text)
+                if not argument:
+                    return "Dùng: /report <mã>, ví dụ /report FPT"
+                symbol = normalize_symbol(argument.split()[0])
+                return format_report(self.provider.get_quote(symbol))
             if command == "/market":
                 return format_quote(self.provider.get_quote("VNINDEX"))
             if command == "/add":
@@ -444,6 +490,9 @@ class BotApplication:
                 return "\n\n".join(lines)
             if command.startswith("/"):
                 return "Chưa nhận diện lệnh. Gõ /help để xem hướng dẫn."
+            if SYMBOL_RE.fullmatch(text.upper()):
+                symbol = normalize_symbol(text)
+                return format_quote(self.provider.get_quote(symbol))
             return None
         except ValueError as exc:
             return html.escape(str(exc))
