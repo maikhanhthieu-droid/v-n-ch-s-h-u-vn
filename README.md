@@ -12,6 +12,9 @@ Repo gốc hiện chỉ có README; bản này là một MVP có thể chạy đ
 - `/report FPT`: báo cáo nhanh gồm giá, mở cửa, cao/thấp phiên và khối lượng
 - `/chart FPT`: biểu đồ chữ 30 phiên để xem nhanh trong Telegram
 - `/ta FPT`: MA5, MA20, RSI14, hỗ trợ/kháng cự gần
+- `/deep FPT`: phân tích sâu hơn bằng P/E, P/B, chiết khấu 52 tuần và Gemini nếu có key
+- `/signals_on`, `/signals_off`, `/signals_status`: bật/tắt tín hiệu lọc sâu VN100
+- `/scan`: quét VN100 ngay, mặc định chỉ gửi mã đạt ngưỡng đủ sâu
 - `/market`: VN-Index
 - `/add FPT`, `/remove FPT`: quản lý danh sách theo dõi theo từng cuộc trò chuyện
 - `/watchlist`, `/watch`: xem và lấy giá danh sách theo dõi
@@ -47,6 +50,39 @@ không khả dụng; bot không đưa ra khuyến nghị đầu tư.
    ```
 
 Các biến tùy chọn: `POLL_TIMEOUT`, `YAHOO_TIMEOUT`, `DATA_DIR`, `LOG_LEVEL`.
+
+## Tín hiệu lọc sâu VN100
+
+Bot có thể tự quét rổ VN100 mặc định 2 lần/tuần và chỉ gửi tối đa vài tín hiệu
+định giá sâu mỗi tháng. Bộ lọc ưu tiên cổ phiếu có:
+
+- Chiết khấu mạnh so với đỉnh 52 tuần
+- P/E và P/B ở vùng thấp/hợp lý
+- RSI đã hạ nhiệt
+- Điểm tổng hợp đạt `MIN_SIGNAL_SCORE`
+
+Lệnh Telegram:
+
+```text
+/signals_on
+/signals_status
+/scan
+/deep FPT
+```
+
+Biến cấu hình:
+
+- `GEMINI_API_KEY`: key Gemini để viết phần phân tích sâu; nếu thiếu, bot vẫn gửi điểm định lượng
+- `GEMINI_MODEL`: mặc định `gemini-2.5-flash`
+- `SCAN_WEEKDAYS`: ngày quét, định dạng số thứ trong tuần của Python; mặc định `0,3` là thứ Hai và thứ Năm
+- `SCAN_TIME`: giờ quét theo giờ máy, mặc định `20:30`
+- `MONTHLY_SIGNAL_LIMIT`: mặc định `2`
+- `MAX_SIGNALS_PER_SCAN`: mặc định `2`
+- `MIN_SIGNAL_SCORE`: mặc định `70`
+- `SIGNAL_COOLDOWN_DAYS`: mặc định `30`
+- `VN100_SYMBOLS`: danh sách mã override, phân tách bằng dấu phẩy nếu rổ VN100 thay đổi
+
+Tín hiệu này là bộ lọc nghiên cứu tự động, không phải khuyến nghị mua/bán.
 
 ## Kiểm thử
 
