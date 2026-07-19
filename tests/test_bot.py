@@ -2,7 +2,8 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import sys
 
@@ -11,11 +12,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bot import (  # noqa: E402
     BotApplication,
     BotError,
+    DeepSignal,
     FundamentalSnapshot,
+    GeminiAnalyzer,
     PriceBar,
     Quote,
     SignalStore,
     WatchlistStore,
+    YahooQuoteProvider,
     score_candidate,
     format_chart,
     format_quote,
@@ -100,6 +104,87 @@ class BotTests(unittest.TestCase):
         score, reasons = score_candidate(snapshot, quote, bars)
         self.assertGreaterEqual(score, 70)
         self.assertTrue(reasons)
+
+    def test_deep_signal_score_rejects_negative_multiples(self):
+        quote = Quote("BAD", "Bad Company", 70.0, 72.0)
+        snapshot = FundamentalSnapshot(
+            symbol="BAD",
+            name="Bad Company",
+            price=70.0,
+            trailing_pe=-4.0,
+            price_to_book=-1.0,
+            fifty_two_week_high=80.0,
+        )
+        bars = [PriceBar(close=70.0 + index / 10) for index in range(30)]
+        score, reasons = score_candidate(snapshot, quote, bars)
+        self.assertLess(score, 70)
+        self.assertFalse(any("P/E" in reason or "P/B" in reason for reason in reasons))
+
+    def test_gemini_interactions_uses_grounding_and_high_thinking(self):
+        captured = {}
+
+        class FakeInteractions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                annotation = SimpleNamespace(
+                    title="Công bố doanh nghiệp",
+                    url="https://example.com/report",
+                )
+                block = SimpleNamespace(
+                    text="1) Định giá: đang ở vùng cần theo dõi.",
+                    annotations=[annotation],
+                )
+                return SimpleNamespace(
+                    output_text=block.text,
+                    steps=[SimpleNamespace(type="model_output", content=[block])],
+                )
+
+        fake_client = SimpleNamespace(interactions=FakeInteractions())
+        analyzer = GeminiAnalyzer(
+            "secret",
+            model="models/gemini-3-flash-preview",
+            client_factory=lambda _: fake_client,
+        )
+        quote = Quote("FPT", "FPT Company", 70.0, 72.0)
+        snapshot = FundamentalSnapshot(
+            symbol="FPT",
+            name="FPT Company",
+            price=70.0,
+            trailing_pe=9.0,
+            price_to_book=1.1,
+            fifty_two_week_high=110.0,
+        )
+        bars = [PriceBar(close=90.0 - index, high=91.0 - index, low=89.0 - index) for index in range(30)]
+        rendered = analyzer.analyze(
+            DeepSignal("FPT", 80, snapshot, quote, bars, ["P/E thấp"])
+        )
+        self.assertEqual(captured["model"], "gemini-3-flash-preview")
+        self.assertEqual(captured["tools"], [{"type": "google_search"}])
+        self.assertEqual(captured["generation_config"]["thinking_level"], "high")
+        self.assertEqual(captured["generation_config"]["temperature"], 1.0)
+        self.assertFalse(captured["store"])
+        self.assertIn("https://example.com/report", rendered)
+
+    def test_gemini_without_key_keeps_quantitative_result(self):
+        analyzer = GeminiAnalyzer("")
+        quote = Quote("FPT", "FPT Company", 70.0, 72.0)
+        snapshot = FundamentalSnapshot("FPT", "FPT Company")
+        signal = DeepSignal("FPT", 70, snapshot, quote, [], [])
+        self.assertIn("chưa có API key", analyzer.analyze(signal))
+
+    def test_fundamentals_batch_uses_one_tradingview_request(self):
+        response = {
+            "data": [
+                {"s": "HOSE:FPT", "d": ["FPT", "FPT Corp", 67000, 11.8, 2.9, 1000]},
+                {"s": "HOSE:HPG", "d": ["HPG", "Hoa Phat", 21850, 8.4, 1.3, 900]},
+            ]
+        }
+        provider = YahooQuoteProvider()
+        with patch("bot._json_post", return_value=response) as post:
+            snapshots = provider.get_fundamentals_batch(["FPT", "HPG"])
+        self.assertEqual(post.call_count, 1)
+        self.assertAlmostEqual(snapshots["FPT"].trailing_pe, 11.8)
+        self.assertAlmostEqual(snapshots["HPG"].price_to_book, 1.3)
 
     def test_watchlist_is_persisted(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1,8 +1,8 @@
-"""Telegram bot for quick Vietnamese equity lookups.
+"""Telegram bot for Vietnamese equity lookups and deep-value alerts.
 
-The project intentionally uses only Python's standard library.  The Telegram
-token is read from TELEGRAM_BOT_TOKEN and is never accepted on the command
-line or written to disk.
+Secrets are read from environment variables and are never accepted on the
+command line or written to disk. The Google Gen AI SDK is optional at runtime:
+without it or without an API key, the quantitative scanner still works.
 
 Commands:
     /start
@@ -11,6 +11,11 @@ Commands:
     /report <TICKER>
     /chart <TICKER>
     /ta <TICKER>
+    /deep <TICKER>
+    /scan
+    /signals_on
+    /signals_off
+    /signals_status
     /market
     /add <TICKER>
     /remove <TICKER>
@@ -35,6 +40,7 @@ import signal
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -43,9 +49,15 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote as url_quote
 from urllib.request import Request, urlopen
 
+try:
+    from google import genai
+except ImportError:  # The quantitative scanner still works without the optional SDK.
+    genai = None
+
 
 LOG = logging.getLogger("vn_equity_bot")
 SYMBOL_RE = re.compile(r"^[A-Z0-9]{1,10}$")
+HTTP_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 MAX_WATCHLIST_SIZE = 10
 DEFAULT_POLL_TIMEOUT = 25
 DEFAULT_YAHOO_TIMEOUT = 12
@@ -53,7 +65,12 @@ DEFAULT_SCAN_WEEKDAYS = "0,3"
 DEFAULT_SCAN_TIME = "20:30"
 DEFAULT_MONTHLY_SIGNAL_LIMIT = 2
 DEFAULT_SIGNAL_COOLDOWN_DAYS = 30
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
+DEFAULT_GEMINI_FALLBACK_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_THINKING_LEVEL = "high"
+DEFAULT_GEMINI_MAX_OUTPUT_TOKENS = 1200
+DEFAULT_GEMINI_TIMEOUT = 45
+DEFAULT_SCAN_WORKERS = 6
 
 VN100_SYMBOLS = [
     "AAA", "ACB", "ANV", "APH", "ASM", "BCM", "BID", "BMP", "BSI", "BVH",
@@ -335,15 +352,37 @@ class YahooQuoteProvider:
 
     def get_fundamentals(self, symbol: str) -> FundamentalSnapshot:
         normalized = symbol.upper()
-        cached = self._fundamental_cache.get(normalized)
+        snapshots = self.get_fundamentals_batch([normalized])
+        if normalized not in snapshots:
+            raise BotError(f"Chưa có dữ liệu định giá cho mã {normalized}.")
+        return snapshots[normalized]
+
+    def get_fundamentals_batch(
+        self,
+        symbols: Iterable[str],
+    ) -> dict[str, FundamentalSnapshot]:
+        """Fetch many TradingView rows in one request and populate the cache."""
+
+        normalized_symbols = list(dict.fromkeys(str(item).upper() for item in symbols))
         now = time.monotonic()
-        if cached and now - cached[0] < self.cache_ttl:
-            return cached[1]
+        snapshots: dict[str, FundamentalSnapshot] = {}
+        missing: list[str] = []
+        for symbol in normalized_symbols:
+            cached = self._fundamental_cache.get(symbol)
+            if cached and now - cached[0] < self.cache_ttl:
+                snapshots[symbol] = cached[1]
+            else:
+                missing.append(symbol)
+        if not missing:
+            return snapshots
 
         payload = _json_post(
             "https://scanner.tradingview.com/vietnam/scan",
             {
-                "symbols": {"tickers": [f"HOSE:{normalized}"], "query": {"types": []}},
+                "symbols": {
+                    "tickers": [f"HOSE:{symbol}" for symbol in missing],
+                    "query": {"types": []},
+                },
                 "columns": [
                     "name",
                     "description",
@@ -355,20 +394,29 @@ class YahooQuoteProvider:
             },
             self.timeout,
         )
-        try:
-            result = payload["data"][0]["d"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise BotError(f"Chưa có dữ liệu định giá cho mã {normalized}.") from exc
-        snapshot = FundamentalSnapshot(
-            symbol=normalized,
-            name=str(result[1] or result[0] or normalized),
-            price=_first_number(result[2]),
-            trailing_pe=_first_number(result[3]),
-            price_to_book=_first_number(result[4]),
-            market_cap=_first_number(result[5]),
-        )
-        self._fundamental_cache[normalized] = (now, snapshot)
-        return snapshot
+        rows = payload.get("data")
+        if not isinstance(rows, list):
+            raise BotError("Nguồn định giá trả về dữ liệu không hợp lệ.")
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            values = row.get("d")
+            ticker = str(row.get("s") or "").rsplit(":", 1)[-1].upper()
+            if not ticker and isinstance(values, list) and values:
+                ticker = str(values[0] or "").upper()
+            if ticker not in missing or not isinstance(values, list) or len(values) < 6:
+                continue
+            snapshot = FundamentalSnapshot(
+                symbol=ticker,
+                name=str(values[1] or values[0] or ticker),
+                price=_first_number(values[2]),
+                trailing_pe=_first_number(values[3]),
+                price_to_book=_first_number(values[4]),
+                market_cap=_first_number(values[5]),
+            )
+            snapshots[ticker] = snapshot
+            self._fundamental_cache[ticker] = (now, snapshot)
+        return snapshots
 
 
 def format_number(value: float | None, decimals: int = 2) -> str:
@@ -697,19 +745,49 @@ class SignalStore:
 
 
 class GeminiAnalyzer:
-    """Optional Gemini summary writer for candidates that pass the numeric filter."""
+    """Grounded Gemini research for candidates that pass the numeric filter."""
 
-    def __init__(self, api_key: str, model: str = DEFAULT_GEMINI_MODEL, timeout: float = 30.0):
+    def __init__(
+        self,
+        api_key: str,
+        model: str = DEFAULT_GEMINI_MODEL,
+        fallback_model: str = DEFAULT_GEMINI_FALLBACK_MODEL,
+        thinking_level: str = DEFAULT_GEMINI_THINKING_LEVEL,
+        max_output_tokens: int = DEFAULT_GEMINI_MAX_OUTPUT_TOKENS,
+        use_google_search: bool = True,
+        timeout: float = DEFAULT_GEMINI_TIMEOUT,
+        client_factory: Callable[[str], Any] | None = None,
+    ):
         self.api_key = api_key.strip()
-        self.model = model.strip() or DEFAULT_GEMINI_MODEL
-        self.timeout = timeout
+        self.model = self._normalize_model(model, DEFAULT_GEMINI_MODEL)
+        self.fallback_model = self._normalize_model(
+            fallback_model,
+            DEFAULT_GEMINI_FALLBACK_MODEL,
+        )
+        level = thinking_level.strip().lower()
+        self.thinking_level = level if level in {"minimal", "low", "medium", "high"} else "high"
+        self.max_output_tokens = max(200, min(int(max_output_tokens), 4096))
+        self.use_google_search = bool(use_google_search)
+        self.timeout = max(5.0, float(timeout))
+        self._client_factory = client_factory
+
+    @staticmethod
+    def _normalize_model(model: str, default: str) -> str:
+        normalized = str(model or "").strip()
+        if normalized.startswith("models/"):
+            normalized = normalized[len("models/") :]
+        return normalized or default
 
     def enabled(self) -> bool:
         return bool(self.api_key)
 
-    def analyze(self, signal: DeepSignal) -> str:
+    def status_text(self) -> str:
         if not self.enabled():
-            return "Gemini chưa cấu hình, bot chỉ gửi phần chấm điểm định lượng."
+            return "chưa có API key"
+        search = "Google Search bật" if self.use_google_search else "Google Search tắt"
+        return f"đã bật ({self.model}, {self.thinking_level}, {search})"
+
+    def _build_prompt(self, signal: DeepSignal) -> str:
         snapshot = signal.snapshot
         quote = signal.quote
         closes = [bar.close for bar in signal.bars]
@@ -717,10 +795,14 @@ class GeminiAnalyzer:
         low_values = [bar.low for bar in signal.bars if bar.low is not None]
         high_52w = snapshot.fifty_two_week_high or (max(high_values) if high_values else None)
         low_52w = snapshot.fifty_two_week_low or (min(low_values) if low_values else None)
-        prompt = (
-            "Bạn là trợ lý nghiên cứu cổ phiếu Việt Nam. Viết phân tích ngắn, thận trọng, "
-            "không được khẳng định chắc chắn và không gọi đây là khuyến nghị đầu tư. "
-            "Tập trung vào định giá P/E, P/B, mức chiết khấu so với đỉnh 52 tuần, rủi ro và điều kiện cần theo dõi.\n\n"
+        return (
+            "Bạn là chuyên viên hỗ trợ nghiên cứu cổ phiếu Việt Nam. Dữ liệu định lượng "
+            "bên dưới do hệ thống cung cấp; không được tự sửa, suy diễn hoặc bịa số còn thiếu. "
+            "Hãy dùng Google Search để kiểm tra thông tin mới nhất từ nguồn sơ cấp/đáng tin "
+            "(công bố doanh nghiệp, HOSE/HNX/SSC, báo cáo tài chính hoặc báo chí tài chính uy tín). "
+            "Phân biệt rõ dữ kiện đã kiểm chứng với nhận định. Nếu không tìm được dữ liệu mới, "
+            "hãy nói thẳng là chưa đủ dữ liệu. Không khẳng định lợi nhuận và không ra lệnh mua/bán.\n\n"
+            f"Ngày phân tích: {datetime.now().strftime('%Y-%m-%d')}\n"
             f"Mã: {signal.symbol}\n"
             f"Tên: {snapshot.name}\n"
             f"Giá: {quote.price}\n"
@@ -732,33 +814,148 @@ class GeminiAnalyzer:
             f"RSI14: {rsi(closes, 14)}\n"
             f"Điểm lọc: {signal.score}/100\n"
             f"Lý do lọc: {', '.join(signal.reasons)}\n\n"
-            "Trả lời tiếng Việt, tối đa 6 dòng."
+            "Trả lời tiếng Việt ngắn gọn theo đúng 6 mục, mỗi mục 1–2 câu: "
+            "1) Định giá; 2) Xu hướng giá; 3) Kết quả kinh doanh/tin mới đã kiểm chứng; "
+            "4) Chất xúc tác; 5) Rủi ro lớn nhất; 6) Điều kiện để đưa vào vùng theo dõi. "
+            "Không chèn bảng và không tự viết danh sách nguồn vì hệ thống sẽ gắn nguồn."
         )
+
+    def _create_client(self) -> Any:
+        if self._client_factory is not None:
+            return self._client_factory(self.api_key)
+        if genai is None:
+            raise RuntimeError("google-genai chưa được cài đặt")
+        return genai.Client(api_key=self.api_key)
+
+    @staticmethod
+    def _extract_interaction(interaction: Any) -> tuple[str, list[tuple[str, str]]]:
+        text = str(getattr(interaction, "output_text", "") or "").strip()
+        sources: list[tuple[str, str]] = []
+        seen_urls: set[str] = set()
+        for step in getattr(interaction, "steps", []) or []:
+            if getattr(step, "type", "") != "model_output":
+                continue
+            for block in getattr(step, "content", []) or []:
+                if not text:
+                    block_text = str(getattr(block, "text", "") or "").strip()
+                    if block_text:
+                        text = block_text
+                for annotation in getattr(block, "annotations", []) or []:
+                    url = str(
+                        getattr(annotation, "url", "")
+                        or getattr(annotation, "uri", "")
+                        or ""
+                    ).strip()
+                    if not HTTP_URL_RE.match(url) or url in seen_urls:
+                        continue
+                    title = str(getattr(annotation, "title", "") or "Nguồn").strip()
+                    sources.append((title[:80], url))
+                    seen_urls.add(url)
+                    if len(sources) >= 3:
+                        break
+                if len(sources) >= 3:
+                    break
+            if len(sources) >= 3:
+                break
+        return text, sources
+
+    @staticmethod
+    def _with_sources(text: str, sources: list[tuple[str, str]]) -> str:
+        clean_text = text.strip()[:2200]
+        if not sources:
+            return clean_text
+        source_lines = ["Nguồn kiểm chứng:"]
+        for title, url in sources:
+            source_lines.append(f"• {title}: {url}")
+        return (clean_text + "\n\n" + "\n".join(source_lines))[:3200]
+
+    def _analyze_interactions(self, prompt: str) -> str:
+        client = self._create_client()
+        tools = [{"type": "google_search"}] if self.use_google_search else None
+        interaction = client.interactions.create(
+            model=self.model,
+            input=prompt,
+            tools=tools,
+            generation_config={
+                "temperature": 1.0,
+                "max_output_tokens": self.max_output_tokens,
+                "top_p": 0.95,
+                "thinking_level": self.thinking_level,
+            },
+            store=False,
+            timeout=self.timeout,
+        )
+        text, sources = self._extract_interaction(interaction)
+        if not text:
+            raise RuntimeError("Gemini không trả về nội dung")
+        return self._with_sources(text, sources)
+
+    def _analyze_legacy_fallback(self, prompt: str) -> str:
         endpoint = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{url_quote(self.model, safe='')}:generateContent"
-            f"?key={url_quote(self.api_key, safe='')}"
+            f"{url_quote(self.fallback_model, safe='')}:generateContent"
         )
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 500},
+            "generationConfig": {
+                "temperature": 1.0,
+                "maxOutputTokens": min(self.max_output_tokens, 1200),
+                "topP": 0.95,
+            },
         }
         request = Request(
             endpoint,
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "x-goog-api-key": self.api_key,
+            },
             method="POST",
         )
+        with urlopen(request, timeout=self.timeout) as response:
+            raw = response.read()
+        result = json.loads(raw.decode("utf-8"))
+        parts = result["candidates"][0]["content"]["parts"]
+        text = "\n".join(str(part.get("text", "")).strip() for part in parts).strip()
+        if not text:
+            raise RuntimeError("Gemini fallback không trả về nội dung")
+        return text[:2200]
+
+    def analyze(self, signal: DeepSignal) -> str:
+        if not self.enabled():
+            return "Gemini chưa có API key; bot đang dùng phần chấm điểm định lượng."
+        prompt = self._build_prompt(signal)
         try:
-            with urlopen(request, timeout=self.timeout) as response:
-                raw = response.read()
-            result = json.loads(raw.decode("utf-8"))
-            parts = result["candidates"][0]["content"]["parts"]
-            text = "\n".join(str(part.get("text", "")).strip() for part in parts).strip()
-        except (HTTPError, URLError, TimeoutError, OSError, KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-            LOG.warning("Gemini analysis failed for %s: %s", signal.symbol, exc)
+            return self._analyze_interactions(prompt)
+        except Exception as primary_exc:  # SDK/API failures must not stop Telegram polling.
+            LOG.warning(
+                "Gemini Interactions failed for %s with model %s: %s",
+                signal.symbol,
+                self.model,
+                type(primary_exc).__name__,
+            )
+        try:
+            return self._analyze_legacy_fallback(prompt)
+        except (
+            HTTPError,
+            URLError,
+            TimeoutError,
+            OSError,
+            KeyError,
+            IndexError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            RuntimeError,
+        ) as fallback_exc:
+            LOG.warning(
+                "Gemini fallback failed for %s with model %s: %s",
+                signal.symbol,
+                self.fallback_model,
+                type(fallback_exc).__name__,
+            )
             return "Gemini không phản hồi lúc này; bot chỉ gửi phần chấm điểm định lượng."
-        return text[:1500] if text else "Gemini không trả về nội dung phân tích."
 
 
 def parse_symbols(raw: str | None) -> list[str]:
@@ -806,14 +1003,14 @@ def score_candidate(
         if 0 < snapshot.trailing_pe <= 10:
             score += 25
             reasons.append(f"P/E thấp ({snapshot.trailing_pe:.2f})")
-        elif snapshot.trailing_pe <= 15:
+        elif 10 < snapshot.trailing_pe <= 15:
             score += 15
             reasons.append(f"P/E hợp lý ({snapshot.trailing_pe:.2f})")
     if snapshot.price_to_book is not None:
         if 0 < snapshot.price_to_book <= 1.2:
             score += 25
             reasons.append(f"P/B thấp ({snapshot.price_to_book:.2f})")
-        elif snapshot.price_to_book <= 1.8:
+        elif 1.2 < snapshot.price_to_book <= 1.8:
             score += 15
             reasons.append(f"P/B chưa quá cao ({snapshot.price_to_book:.2f})")
     closes = [bar.close for bar in bars]
@@ -866,26 +1063,86 @@ class DeepSignalScanner:
         symbols: list[str],
         min_score: int = 70,
         max_per_scan: int = 2,
+        max_workers: int = DEFAULT_SCAN_WORKERS,
     ):
         self.provider = provider
         self.gemini = gemini
         self.symbols = symbols
         self.min_score = min_score
         self.max_per_scan = max_per_scan
+        self.max_workers = max(1, min(int(max_workers), 12))
+
+    @staticmethod
+    def _valuation_points(snapshot: FundamentalSnapshot) -> int:
+        points = 0
+        pe = snapshot.trailing_pe
+        pb = snapshot.price_to_book
+        if pe is not None:
+            if 0 < pe <= 10:
+                points += 25
+            elif 10 < pe <= 15:
+                points += 15
+        if pb is not None:
+            if 0 < pb <= 1.2:
+                points += 25
+            elif 1.2 < pb <= 1.8:
+                points += 15
+        return points
+
+    def _evaluate(
+        self,
+        symbol: str,
+        snapshot: FundamentalSnapshot,
+    ) -> DeepSignal | None:
+        quote = self.provider.get_quote(symbol)
+        bars = self.provider.get_history(symbol, range_value="1y", interval="1d")
+        score, reasons = score_candidate(snapshot, quote, bars)
+        if score < self.min_score:
+            return None
+        return DeepSignal(symbol, score, snapshot, quote, bars, reasons)
 
     def find_candidates(self) -> list[DeepSignal]:
-        candidates: list[DeepSignal] = []
-        for symbol in self.symbols:
+        batch_getter = getattr(self.provider, "get_fundamentals_batch", None)
+        if callable(batch_getter):
             try:
-                quote = self.provider.get_quote(symbol)
-                bars = self.provider.get_history(symbol, range_value="1y", interval="1d")
-                snapshot = self.provider.get_fundamentals(symbol)
-                score, reasons = score_candidate(snapshot, quote, bars)
+                snapshots = batch_getter(self.symbols)
             except BotError as exc:
-                LOG.info("Skipping %s: %s", symbol, exc)
-                continue
-            if score >= self.min_score:
-                candidates.append(DeepSignal(symbol, score, snapshot, quote, bars, reasons))
+                LOG.warning("Cannot fetch VN100 fundamentals batch: %s", exc)
+                return []
+        else:
+            snapshots = {}
+            for symbol in self.symbols:
+                try:
+                    snapshots[symbol] = self.provider.get_fundamentals(symbol)
+                except BotError as exc:
+                    LOG.info("Skipping %s fundamentals: %s", symbol, exc)
+
+        # Price/RSI/discount can contribute at most 60 points. Avoid two Yahoo
+        # requests for symbols that cannot mathematically reach the threshold.
+        eligible = [
+            symbol
+            for symbol in self.symbols
+            if symbol in snapshots
+            and self._valuation_points(snapshots[symbol]) + 60 >= self.min_score
+        ]
+        candidates: list[DeepSignal] = []
+        with ThreadPoolExecutor(max_workers=min(self.max_workers, len(eligible) or 1)) as executor:
+            future_symbols = {
+                executor.submit(self._evaluate, symbol, snapshots[symbol]): symbol
+                for symbol in eligible
+            }
+            for future in as_completed(future_symbols):
+                symbol = future_symbols[future]
+                try:
+                    candidate = future.result()
+                except BotError as exc:
+                    LOG.info("Skipping %s: %s", symbol, exc)
+                    continue
+                except Exception as exc:
+                    LOG.warning("Unexpected scan error for %s: %s", symbol, type(exc).__name__)
+                    continue
+                if candidate is not None:
+                    candidates.append(candidate)
         return sorted(candidates, key=lambda item: item.score, reverse=True)[: self.max_per_scan]
 
     def render_signal(self, signal: DeepSignal) -> str:
@@ -1008,6 +1265,40 @@ def parse_scan_time(raw: str) -> tuple[int, int]:
     return hour, minute
 
 
+def parse_bool(raw: str | None, default: bool = False) -> bool:
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def build_gemini_analyzer() -> GeminiAnalyzer:
+    try:
+        max_tokens = int(
+            os.environ.get(
+                "GEMINI_MAX_OUTPUT_TOKENS",
+                str(DEFAULT_GEMINI_MAX_OUTPUT_TOKENS),
+            )
+        )
+        timeout = float(os.environ.get("GEMINI_TIMEOUT", str(DEFAULT_GEMINI_TIMEOUT)))
+    except ValueError as exc:
+        raise ValueError("GEMINI_MAX_OUTPUT_TOKENS/GEMINI_TIMEOUT phải là số.") from exc
+    return GeminiAnalyzer(
+        os.environ.get("GEMINI_API_KEY", ""),
+        model=os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
+        fallback_model=os.environ.get(
+            "GEMINI_FALLBACK_MODEL",
+            DEFAULT_GEMINI_FALLBACK_MODEL,
+        ),
+        thinking_level=os.environ.get(
+            "GEMINI_THINKING_LEVEL",
+            DEFAULT_GEMINI_THINKING_LEVEL,
+        ),
+        max_output_tokens=max_tokens,
+        use_google_search=parse_bool(os.environ.get("GEMINI_GOOGLE_SEARCH"), True),
+        timeout=timeout,
+    )
+
+
 def due_for_scheduled_scan(app: "BotApplication", weekdays: set[int], scan_time: tuple[int, int]) -> bool:
     if not app.signal_store:
         return False
@@ -1102,7 +1393,7 @@ class BotApplication:
                 score, reasons = score_candidate(snapshot, quote, bars)
                 scanner = self.scanner or DeepSignalScanner(
                     self.provider,
-                    GeminiAnalyzer(os.environ.get("GEMINI_API_KEY", "")),
+                    build_gemini_analyzer(),
                     [symbol],
                 )
                 return scanner.render_signal(DeepSignal(symbol, score, snapshot, quote, bars, reasons))
@@ -1120,8 +1411,14 @@ class BotApplication:
                 if not self.signal_store:
                     return "Tính năng tín hiệu chưa được cấu hình."
                 enabled = str(chat_id) in self.signal_store.chats()
+                gemini_status = (
+                    self.scanner.gemini.status_text()
+                    if self.scanner is not None
+                    else "chưa cấu hình"
+                )
                 return (
                     f"Tín hiệu: {'đang bật' if enabled else 'đang tắt'}\n"
+                    f"Gemini: {gemini_status}\n"
                     f"Giới hạn: tối đa {self.monthly_signal_limit} mã/tháng\n"
                     f"Cooldown mỗi mã: {self.signal_cooldown_days} ngày\n"
                     f"Lần quét cuối: {self.signal_store.last_scan_date() or 'chưa có'}"
@@ -1254,14 +1551,12 @@ def build_application() -> BotApplication:
         max_signals_per_scan = int(os.environ.get("MAX_SIGNALS_PER_SCAN", "2"))
         monthly_signal_limit = int(os.environ.get("MONTHLY_SIGNAL_LIMIT", DEFAULT_MONTHLY_SIGNAL_LIMIT))
         signal_cooldown_days = int(os.environ.get("SIGNAL_COOLDOWN_DAYS", DEFAULT_SIGNAL_COOLDOWN_DAYS))
+        scan_workers = int(os.environ.get("SCAN_WORKERS", DEFAULT_SCAN_WORKERS))
     except ValueError as exc:
         raise ValueError("Các biến timeout/score/limit phải là số.") from exc
     telegram = TelegramClient(token, timeout=max(10.0, poll_timeout + 10.0))
     provider = YahooQuoteProvider(timeout=max(1.0, yahoo_timeout))
-    gemini = GeminiAnalyzer(
-        os.environ.get("GEMINI_API_KEY", ""),
-        model=os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
-    )
+    gemini = build_gemini_analyzer()
     symbols = parse_symbols(os.environ.get("VN100_SYMBOLS"))
     return BotApplication(
         telegram=telegram,
@@ -1274,6 +1569,7 @@ def build_application() -> BotApplication:
             symbols=symbols,
             min_score=min_signal_score,
             max_per_scan=max_signals_per_scan,
+            max_workers=scan_workers,
         ),
         monthly_signal_limit=monthly_signal_limit,
         signal_cooldown_days=signal_cooldown_days,

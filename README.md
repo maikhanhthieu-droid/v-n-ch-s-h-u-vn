@@ -1,8 +1,7 @@
 # VN Equity Bot
 
-Bot Telegram tối giản để tra cứu nhanh dữ liệu tham khảo của cổ phiếu Việt Nam.
-Repo gốc hiện chỉ có README; bản này là một MVP có thể chạy độc lập bằng Python
-3.10+ và không cần thư viện bên ngoài.
+Bot Telegram để tra cứu, lọc định giá và theo dõi cổ phiếu Việt Nam. Bot chạy
+trên Python 3.10+ và dùng Google Gen AI SDK cho phần nghiên cứu có kiểm chứng.
 
 ## Tính năng
 
@@ -12,7 +11,7 @@ Repo gốc hiện chỉ có README; bản này là một MVP có thể chạy đ
 - `/report FPT`: báo cáo nhanh gồm giá, mở cửa, cao/thấp phiên và khối lượng
 - `/chart FPT`: biểu đồ chữ 30 phiên để xem nhanh trong Telegram
 - `/ta FPT`: MA5, MA20, RSI14, hỗ trợ/kháng cự gần
-- `/deep FPT`: phân tích sâu hơn bằng P/E, P/B, chiết khấu 52 tuần và Gemini nếu có key
+- `/deep FPT`: phân tích P/E, P/B, chiết khấu 52 tuần; Gemini có thể kiểm tra tin mới bằng Google Search
 - `/signals_on`, `/signals_off`, `/signals_status`: bật/tắt tín hiệu lọc sâu VN100
 - `/scan`: quét VN100 ngay, mặc định chỉ gửi mã đạt ngưỡng đủ sâu
 - `/market`: VN-Index
@@ -27,16 +26,27 @@ không khả dụng; bot không đưa ra khuyến nghị đầu tư.
 ## Chạy cục bộ
 
 1. Vào `@BotFather`, thu hồi token đã từng được đăng trong chat và tạo token mới.
-2. Tạo biến môi trường (PowerShell):
+2. Tạo môi trường riêng và cài thư viện:
+
+   ```powershell
+   python -m venv .venv
+   .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+   ```
+
+3. Tạo biến môi trường (PowerShell):
 
    ```powershell
    $env:TELEGRAM_BOT_TOKEN = "<TOKEN_MỚI>"
+   $env:GEMINI_API_KEY = "<KEY_GEMINI_THẬT>"
    ```
 
-3. Chạy bot:
+   Lưu ý: `os.environ.get("GEMINI_API_KEY")` chỉ là lệnh đọc biến môi trường,
+   không phải API key. Key thật là chuỗi được tạo trong Google AI Studio.
+
+4. Chạy bot:
 
    ```powershell
-   python bot.py
+   .\.venv\Scripts\python.exe bot.py
    ```
 
    Bot dùng long polling, nên cửa sổ/process phải luôn chạy. Gửi `/start` cho bot
@@ -54,7 +64,9 @@ Các biến tùy chọn: `POLL_TIMEOUT`, `YAHOO_TIMEOUT`, `DATA_DIR`, `LOG_LEVEL
 ## Tín hiệu lọc sâu VN100
 
 Bot có thể tự quét rổ VN100 mặc định 2 lần/tuần và chỉ gửi tối đa vài tín hiệu
-định giá sâu mỗi tháng. Bộ lọc ưu tiên cổ phiếu có:
+định giá sâu mỗi tháng. TradingView được gọi theo lô, còn dữ liệu lịch sử được
+lấy song song có giới hạn để lần quét hoàn thành nhanh hơn. Bộ lọc ưu tiên cổ
+phiếu có:
 
 - Chiết khấu mạnh so với đỉnh 52 tuần
 - P/E và P/B ở vùng thấp/hợp lý
@@ -72,10 +84,16 @@ Lệnh Telegram:
 
 Biến cấu hình:
 
-- `GEMINI_API_KEY`: key Gemini để viết phần phân tích sâu; nếu thiếu, bot vẫn gửi điểm định lượng
-- `GEMINI_MODEL`: mặc định `gemini-2.5-flash`
+- `GEMINI_API_KEY`: key Gemini thật; nếu thiếu, bot vẫn gửi điểm định lượng
+- `GEMINI_MODEL`: mặc định `gemini-3-flash-preview`
+- `GEMINI_FALLBACK_MODEL`: mặc định `gemini-2.5-flash`
+- `GEMINI_THINKING_LEVEL`: mặc định `high`
+- `GEMINI_MAX_OUTPUT_TOKENS`: mặc định `1200`; không cần `65536` cho Telegram
+- `GEMINI_GOOGLE_SEARCH`: mặc định `true`, gắn tối đa 3 nguồn kiểm chứng
+- `GEMINI_TIMEOUT`: mặc định `45` giây
 - `SCAN_WEEKDAYS`: ngày quét, định dạng số thứ trong tuần của Python; mặc định `0,3` là thứ Hai và thứ Năm
 - `SCAN_TIME`: giờ quét theo giờ máy, mặc định `20:30`
+- `SCAN_WORKERS`: mặc định `6`, tối đa nội bộ `12`
 - `MONTHLY_SIGNAL_LIMIT`: mặc định `2`
 - `MAX_SIGNALS_PER_SCAN`: mặc định `2`
 - `MIN_SIGNAL_SCORE`: mặc định `70`
