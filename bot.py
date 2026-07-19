@@ -66,7 +66,7 @@ DEFAULT_SCAN_TIME = "20:30"
 DEFAULT_MONTHLY_SIGNAL_LIMIT = 2
 DEFAULT_SIGNAL_COOLDOWN_DAYS = 30
 DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
-DEFAULT_GEMINI_FALLBACK_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_FALLBACK_MODEL = "gemini-3.5-flash"
 DEFAULT_GEMINI_THINKING_LEVEL = "high"
 DEFAULT_GEMINI_MAX_OUTPUT_TOKENS = 3000
 DEFAULT_GEMINI_TIMEOUT = 45
@@ -884,13 +884,18 @@ class GeminiAnalyzer:
             source_lines.append(f"• {title}: {url}")
         return (clean_text + "\n\n" + "\n".join(source_lines))[:3200]
 
-    def _analyze_interactions(self, prompt: str, use_search: bool | None = None) -> str:
+    def _analyze_interactions(
+        self,
+        prompt: str,
+        use_search: bool | None = None,
+        model: str | None = None,
+    ) -> str:
         client = self._create_client()
         if use_search is None:
             use_search = self.use_google_search and time.monotonic() >= self._search_disabled_until
         tools = [{"type": "google_search"}] if use_search else None
         interaction = client.interactions.create(
-            model=self.model,
+            model=model or self.model,
             input=prompt,
             tools=tools,
             generation_config={
@@ -971,6 +976,19 @@ class GeminiAnalyzer:
                         signal.symbol,
                         type(no_search_exc).__name__,
                     )
+                    try:
+                        fallback_text = self._analyze_interactions(
+                            offline_prompt,
+                            use_search=False,
+                            model=self.fallback_model,
+                        )
+                        return fallback_text + "\n\n(Gemini đang dùng model dự phòng.)"
+                    except Exception as model_fallback_exc:
+                        LOG.warning(
+                            "Gemini model fallback failed for %s: %s",
+                            signal.symbol,
+                            type(model_fallback_exc).__name__,
+                        )
         try:
             return self._analyze_legacy_fallback(
                 self._build_prompt(signal, allow_search=False)

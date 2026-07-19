@@ -86,7 +86,7 @@ Biến cấu hình:
 
 - `GEMINI_API_KEY`: key Gemini thật; nếu thiếu, bot vẫn gửi điểm định lượng
 - `GEMINI_MODEL`: mặc định `gemini-3-flash-preview`
-- `GEMINI_FALLBACK_MODEL`: mặc định `gemini-2.5-flash`
+- `GEMINI_FALLBACK_MODEL`: mặc định `gemini-3.5-flash`
 - `GEMINI_THINKING_LEVEL`: mặc định `high`
 - `GEMINI_MAX_OUTPUT_TOKENS`: mặc định `3000`; không cần `65536` cho Telegram
 - `GEMINI_GOOGLE_SEARCH`: mặc định `true`, gắn tối đa 3 nguồn kiểm chứng; nếu
