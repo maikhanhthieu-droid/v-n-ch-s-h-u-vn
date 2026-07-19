@@ -88,8 +88,10 @@ Biến cấu hình:
 - `GEMINI_MODEL`: mặc định `gemini-3-flash-preview`
 - `GEMINI_FALLBACK_MODEL`: mặc định `gemini-2.5-flash`
 - `GEMINI_THINKING_LEVEL`: mặc định `high`
-- `GEMINI_MAX_OUTPUT_TOKENS`: mặc định `1200`; không cần `65536` cho Telegram
-- `GEMINI_GOOGLE_SEARCH`: mặc định `true`, gắn tối đa 3 nguồn kiểm chứng
+- `GEMINI_MAX_OUTPUT_TOKENS`: mặc định `3000`; không cần `65536` cho Telegram
+- `GEMINI_GOOGLE_SEARCH`: mặc định `true`, gắn tối đa 3 nguồn kiểm chứng; nếu
+  project bị giới hạn grounding/quota, bot tự chuyển sang phân tích không web
+  trong 1 giờ để không làm hỏng tín hiệu
 - `GEMINI_TIMEOUT`: mặc định `45` giây
 - `SCAN_WEEKDAYS`: ngày quét, định dạng số thứ trong tuần của Python; mặc định `0,3` là thứ Hai và thứ Năm
 - `SCAN_TIME`: giờ quét theo giờ máy, mặc định `20:30`

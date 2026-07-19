@@ -68,7 +68,7 @@ DEFAULT_SIGNAL_COOLDOWN_DAYS = 30
 DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
 DEFAULT_GEMINI_FALLBACK_MODEL = "gemini-2.5-flash"
 DEFAULT_GEMINI_THINKING_LEVEL = "high"
-DEFAULT_GEMINI_MAX_OUTPUT_TOKENS = 1200
+DEFAULT_GEMINI_MAX_OUTPUT_TOKENS = 3000
 DEFAULT_GEMINI_TIMEOUT = 45
 DEFAULT_SCAN_WORKERS = 6
 
@@ -770,6 +770,7 @@ class GeminiAnalyzer:
         self.use_google_search = bool(use_google_search)
         self.timeout = max(5.0, float(timeout))
         self._client_factory = client_factory
+        self._search_disabled_until = 0.0
 
     @staticmethod
     def _normalize_model(model: str, default: str) -> str:
@@ -787,7 +788,7 @@ class GeminiAnalyzer:
         search = "Google Search bật" if self.use_google_search else "Google Search tắt"
         return f"đã bật ({self.model}, {self.thinking_level}, {search})"
 
-    def _build_prompt(self, signal: DeepSignal) -> str:
+    def _build_prompt(self, signal: DeepSignal, allow_search: bool = True) -> str:
         snapshot = signal.snapshot
         quote = signal.quote
         closes = [bar.close for bar in signal.bars]
@@ -795,13 +796,22 @@ class GeminiAnalyzer:
         low_values = [bar.low for bar in signal.bars if bar.low is not None]
         high_52w = snapshot.fifty_two_week_high or (max(high_values) if high_values else None)
         low_52w = snapshot.fifty_two_week_low or (min(low_values) if low_values else None)
-        return (
-            "Bạn là chuyên viên hỗ trợ nghiên cứu cổ phiếu Việt Nam. Dữ liệu định lượng "
-            "bên dưới do hệ thống cung cấp; không được tự sửa, suy diễn hoặc bịa số còn thiếu. "
+        web_instruction = (
             "Hãy dùng Google Search để kiểm tra thông tin mới nhất từ nguồn sơ cấp/đáng tin "
             "(công bố doanh nghiệp, HOSE/HNX/SSC, báo cáo tài chính hoặc báo chí tài chính uy tín). "
             "Phân biệt rõ dữ kiện đã kiểm chứng với nhận định. Nếu không tìm được dữ liệu mới, "
-            "hãy nói thẳng là chưa đủ dữ liệu. Không khẳng định lợi nhuận và không ra lệnh mua/bán.\n\n"
+            "hãy nói thẳng là chưa đủ dữ liệu."
+            if allow_search
+            else
+            "Google Search hiện không khả dụng. Chỉ được dùng các số liệu hệ thống cung cấp; "
+            "không được tự đưa tin, số liệu kết quả kinh doanh, mục tiêu giá hoặc sự kiện hiện tại "
+            "không xuất hiện trong dữ liệu đầu vào. Với phần tin tức, ghi rõ là chưa có dữ liệu."
+        )
+        return (
+            "Bạn là chuyên viên hỗ trợ nghiên cứu cổ phiếu Việt Nam. Dữ liệu định lượng "
+            "bên dưới do hệ thống cung cấp; không được tự sửa, suy diễn hoặc bịa số còn thiếu. "
+            f"{web_instruction} "
+            "Không khẳng định lợi nhuận và không ra lệnh mua/bán.\n\n"
             f"Ngày phân tích: {datetime.now().strftime('%Y-%m-%d')}\n"
             f"Mã: {signal.symbol}\n"
             f"Tên: {snapshot.name}\n"
@@ -869,9 +879,11 @@ class GeminiAnalyzer:
             source_lines.append(f"• {title}: {url}")
         return (clean_text + "\n\n" + "\n".join(source_lines))[:3200]
 
-    def _analyze_interactions(self, prompt: str) -> str:
+    def _analyze_interactions(self, prompt: str, use_search: bool | None = None) -> str:
         client = self._create_client()
-        tools = [{"type": "google_search"}] if self.use_google_search else None
+        if use_search is None:
+            use_search = self.use_google_search and time.monotonic() >= self._search_disabled_until
+        tools = [{"type": "google_search"}] if use_search else None
         interaction = client.interactions.create(
             model=self.model,
             input=prompt,
@@ -925,9 +937,10 @@ class GeminiAnalyzer:
     def analyze(self, signal: DeepSignal) -> str:
         if not self.enabled():
             return "Gemini chưa có API key; bot đang dùng phần chấm điểm định lượng."
-        prompt = self._build_prompt(signal)
+        search_attempted = self.use_google_search and time.monotonic() >= self._search_disabled_until
+        prompt = self._build_prompt(signal, allow_search=search_attempted)
         try:
-            return self._analyze_interactions(prompt)
+            return self._analyze_interactions(prompt, use_search=search_attempted)
         except Exception as primary_exc:  # SDK/API failures must not stop Telegram polling.
             LOG.warning(
                 "Gemini Interactions failed for %s with model %s: %s",
@@ -935,8 +948,28 @@ class GeminiAnalyzer:
                 self.model,
                 type(primary_exc).__name__,
             )
+            if search_attempted:
+                # Google Search grounding is unavailable on some free-tier
+                # projects. Keep the AI analysis useful and avoid retry storms.
+                self._search_disabled_until = time.monotonic() + 3600.0
+                try:
+                    offline_prompt = self._build_prompt(signal, allow_search=False)
+                    fallback_text = self._analyze_interactions(offline_prompt, use_search=False)
+                    return (
+                        fallback_text
+                        + "\n\n(Google Search đang tạm thời bị giới hạn; "
+                        "phần trên dựa trên dữ liệu định lượng đã cung cấp.)"
+                    )
+                except Exception as no_search_exc:
+                    LOG.warning(
+                        "Gemini no-search fallback failed for %s: %s",
+                        signal.symbol,
+                        type(no_search_exc).__name__,
+                    )
         try:
-            return self._analyze_legacy_fallback(prompt)
+            return self._analyze_legacy_fallback(
+                self._build_prompt(signal, allow_search=False)
+            )
         except (
             HTTPError,
             URLError,

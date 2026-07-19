@@ -165,6 +165,39 @@ class BotTests(unittest.TestCase):
         self.assertFalse(captured["store"])
         self.assertIn("https://example.com/report", rendered)
 
+    def test_gemini_falls_back_without_search_when_grounding_is_limited(self):
+        calls = []
+
+        class FakeInteractions:
+            def create(self, **kwargs):
+                calls.append(kwargs)
+                if kwargs.get("tools"):
+                    raise RuntimeError("429")
+                return SimpleNamespace(
+                    output_text="Định giá: dựa trên số liệu đầu vào.",
+                    steps=[],
+                )
+
+        analyzer = GeminiAnalyzer(
+            "secret",
+            client_factory=lambda _: SimpleNamespace(interactions=FakeInteractions()),
+        )
+        quote = Quote("HPG", "Hoa Phat", 21_850.0, 22_000.0)
+        snapshot = FundamentalSnapshot(
+            "HPG",
+            "Hoa Phat",
+            price=21_850.0,
+            trailing_pe=8.4,
+            price_to_book=1.33,
+        )
+        rendered = analyzer.analyze(
+            DeepSignal("HPG", 85, snapshot, quote, [], ["P/E thấp"])
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertIsNone(calls[1]["tools"])
+        self.assertIn("Google Search đang tạm thời bị giới hạn", rendered)
+        self.assertIn("không được tự đưa tin", calls[1]["input"])
+
     def test_gemini_without_key_keeps_quantitative_result(self):
         analyzer = GeminiAnalyzer("")
         quote = Quote("FPT", "FPT Company", 70.0, 72.0)
