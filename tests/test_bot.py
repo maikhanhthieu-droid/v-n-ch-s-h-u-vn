@@ -197,6 +197,7 @@ class BotTests(unittest.TestCase):
         self.assertIsNone(calls[1]["tools"])
         self.assertIn("Google Search đang tạm thời bị giới hạn", rendered)
         self.assertIn("không được tự đưa tin", calls[1]["input"])
+        self.assertIn("quota giới hạn", analyzer.status_text())
 
     def test_gemini_without_key_keeps_quantitative_result(self):
         analyzer = GeminiAnalyzer("")

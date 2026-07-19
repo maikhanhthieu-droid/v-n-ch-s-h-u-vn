@@ -785,7 +785,12 @@ class GeminiAnalyzer:
     def status_text(self) -> str:
         if not self.enabled():
             return "chưa có API key"
-        search = "Google Search bật" if self.use_google_search else "Google Search tắt"
+        if self.use_google_search and time.monotonic() < self._search_disabled_until:
+            search = "Search đang bị quota giới hạn, dùng fallback số liệu"
+        elif self.use_google_search:
+            search = "Google Search bật"
+        else:
+            search = "Google Search tắt"
         return f"đã bật ({self.model}, {self.thinking_level}, {search})"
 
     def _build_prompt(self, signal: DeepSignal, allow_search: bool = True) -> str:
