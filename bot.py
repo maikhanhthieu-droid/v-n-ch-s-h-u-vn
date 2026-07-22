@@ -75,6 +75,9 @@ DEFAULT_GEMINI_MIN_INTERVAL = 60.0
 DEFAULT_GEMINI_CACHE_TTL = 1800
 DEFAULT_GEMINI_QUOTA_COOLDOWN = 900
 DEFAULT_RESEARCH_COMMAND_COOLDOWN = 60.0
+DEFAULT_GEMINI_DAILY_BUDGET = 12
+DEFAULT_DEEP_DAILY_LIMIT = 10
+DEFAULT_SCAN_DAILY_LIMIT = 2
 DEFAULT_SCAN_WORKERS = 4
 
 VN100_SYMBOLS = [
@@ -105,6 +108,10 @@ class GeminiRequestCooldown(RuntimeError):
     def __init__(self, remaining: float):
         self.remaining = max(1, int(remaining) + 1)
         super().__init__(f"Gemini request cooldown: {self.remaining}s")
+
+
+class GeminiDailyBudgetReached(RuntimeError):
+    """Raised internally before an API call would exceed the daily budget."""
 
 
 @dataclass(frozen=True)
@@ -761,6 +768,130 @@ class SignalStore:
         self._save()
 
 
+class ApiUsageStore:
+    """Persist conservative daily counters used to protect upstream quotas."""
+
+    COUNTERS = ("gemini_requests", "deep_commands", "scan_commands")
+
+    def __init__(
+        self,
+        path: Path,
+        gemini_daily_budget: int = DEFAULT_GEMINI_DAILY_BUDGET,
+        deep_daily_limit: int = DEFAULT_DEEP_DAILY_LIMIT,
+        scan_daily_limit: int = DEFAULT_SCAN_DAILY_LIMIT,
+    ):
+        self.path = path
+        self.limits = {
+            "gemini_requests": max(1, int(gemini_daily_budget)),
+            "deep_commands": max(1, int(deep_daily_limit)),
+            "scan_commands": max(1, int(scan_daily_limit)),
+        }
+        self._lock = threading.Lock()
+        self._data: dict[str, Any] = self._empty_data()
+        self._load()
+
+    @staticmethod
+    def _today() -> str:
+        # Fixed UTC+7 keeps the daily reset stable on Windows and cloud hosts.
+        return time.strftime("%Y-%m-%d", time.gmtime(time.time() + 7 * 3600))
+
+    def _empty_data(self) -> dict[str, Any]:
+        return {"date": self._today(), **{name: 0 for name in self.COUNTERS}}
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            LOG.warning("API usage file is unreadable; starting empty.")
+            return
+        if not isinstance(raw, dict):
+            return
+        self._data = {
+            "date": str(raw.get("date") or ""),
+            **{
+                name: max(0, int(raw.get(name, 0)))
+                if str(raw.get(name, 0)).lstrip("-").isdigit()
+                else 0
+                for name in self.COUNTERS
+            },
+        }
+        self._rollover_locked()
+
+    def _rollover_locked(self) -> None:
+        if self._data.get("date") != self._today():
+            self._data = self._empty_data()
+            self._save_locked()
+
+    def _save_locked(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f"{self.path.name}.", suffix=".tmp", dir=str(self.path.parent)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(self._data, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+            os.replace(temp_name, self.path)
+        finally:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+
+    def claim(self, counter: str) -> tuple[bool, int, int]:
+        if counter not in self.limits:
+            raise ValueError(f"Unknown usage counter: {counter}")
+        with self._lock:
+            self._rollover_locked()
+            used = int(self._data.get(counter, 0))
+            limit = self.limits[counter]
+            if used >= limit:
+                return False, used, limit
+            used += 1
+            self._data[counter] = used
+            self._save_locked()
+            return True, used, limit
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            self._rollover_locked()
+            return {
+                "date": self._data["date"],
+                **{
+                    name: {
+                        "used": int(self._data.get(name, 0)),
+                        "limit": self.limits[name],
+                    }
+                    for name in self.COUNTERS
+                },
+            }
+
+    @staticmethod
+    def _meter(used: int, limit: int) -> str:
+        percent = min(100, round(used * 100 / max(1, limit)))
+        filled = min(10, round(percent / 10))
+        return f"{'█' * filled}{'░' * (10 - filled)} {percent}%"
+
+    def format_status(self, gemini_status: str) -> str:
+        data = self.snapshot()
+        gemini = data["gemini_requests"]
+        deep = data["deep_commands"]
+        scan = data["scan_commands"]
+        return (
+            "<b>Ngân sách API an toàn hôm nay</b>\n"
+            f"Gemini: {gemini['used']}/{gemini['limit']} "
+            f"— {self._meter(gemini['used'], gemini['limit'])}\n"
+            f"/deep: {deep['used']}/{deep['limit']} "
+            f"— {self._meter(deep['used'], deep['limit'])}\n"
+            f"/scan: {scan['used']}/{scan['limit']} "
+            f"— {self._meter(scan['used'], scan['limit'])}\n"
+            f"Trạng thái Gemini: {html.escape(gemini_status)}\n"
+            "Đặt lại lúc 00:00 (UTC+7). Đây là bộ đếm nội bộ, không phải quota trực tiếp từ Google."
+        )
+
+
 class GeminiAnalyzer:
     """Grounded Gemini research for candidates that pass the numeric filter."""
 
@@ -776,6 +907,7 @@ class GeminiAnalyzer:
         min_interval: float = DEFAULT_GEMINI_MIN_INTERVAL,
         cache_ttl: float = DEFAULT_GEMINI_CACHE_TTL,
         quota_cooldown: float = DEFAULT_GEMINI_QUOTA_COOLDOWN,
+        usage_store: ApiUsageStore | None = None,
         client_factory: Callable[[str], Any] | None = None,
     ):
         self.api_key = api_key.strip()
@@ -792,6 +924,7 @@ class GeminiAnalyzer:
         self.min_interval = max(0.0, float(min_interval))
         self.cache_ttl = max(0.0, float(cache_ttl))
         self.quota_cooldown = max(60.0, float(quota_cooldown))
+        self.usage_store = usage_store
         self._client_factory = client_factory
         self._search_disabled_until = 0.0
         self._quota_disabled_until = 0.0
@@ -844,6 +977,10 @@ class GeminiAnalyzer:
             delay = self.min_interval - (time.monotonic() - self._last_request_at)
             if delay > 0:
                 raise GeminiRequestCooldown(delay)
+            if self.usage_store is not None:
+                allowed, _, _ = self.usage_store.claim("gemini_requests")
+                if not allowed:
+                    raise GeminiDailyBudgetReached("Gemini daily safety budget reached")
             self._last_request_at = time.monotonic()
 
     def _cached_result(self, symbol: str) -> str | None:
@@ -876,6 +1013,13 @@ class GeminiAnalyzer:
         return (
             f"Gemini đang giới hạn nhịp để bảo vệ quota; hãy thử lại sau {remaining} giây. "
             "Bot vẫn gửi phần chấm điểm định lượng."
+        )
+
+    @staticmethod
+    def _daily_budget_message() -> str:
+        return (
+            "Gemini đã đạt 100% ngân sách an toàn hôm nay; bot chỉ gửi phần chấm điểm "
+            "định lượng và sẽ tự mở lại lúc 00:00 (UTC+7)."
         )
 
     def status_text(self) -> str:
@@ -1063,6 +1207,8 @@ class GeminiAnalyzer:
             return result
         except GeminiRequestCooldown as cooldown_exc:
             return self._rate_message(cooldown_exc.remaining)
+        except GeminiDailyBudgetReached:
+            return self._daily_budget_message()
         except GeminiQuotaCircuitOpen:
             return self._quota_message()
         except Exception as primary_exc:  # SDK/API failures must not stop Telegram polling.
@@ -1104,6 +1250,8 @@ class GeminiAnalyzer:
             return result
         except GeminiRequestCooldown as cooldown_exc:
             return self._rate_message(cooldown_exc.remaining)
+        except GeminiDailyBudgetReached:
+            return self._daily_budget_message()
         except GeminiQuotaCircuitOpen:
             return self._quota_message()
         except Exception as fallback_exc:
@@ -1392,6 +1540,7 @@ HELP = (
     "/remove <code>FPT</code> — xóa khỏi danh sách\n"
     "/watchlist — xem danh sách đã lưu\n"
     "/watch — lấy giá toàn bộ danh sách\n"
+    "/usage — xem phần trăm ngân sách API trong ngày\n"
     "/ping — kiểm tra bot\n\n"
     "Ví dụ: <code>/quote VNM</code>\n"
     "Bạn cũng có thể gõ trực tiếp <code>FPT</code> hoặc <code>VNM</code>."
@@ -1432,7 +1581,7 @@ def parse_bool(raw: str | None, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
-def build_gemini_analyzer() -> GeminiAnalyzer:
+def build_gemini_analyzer(usage_store: ApiUsageStore | None = None) -> GeminiAnalyzer:
     try:
         max_tokens = int(
             os.environ.get(
@@ -1469,6 +1618,7 @@ def build_gemini_analyzer() -> GeminiAnalyzer:
         min_interval=min_interval,
         cache_ttl=cache_ttl,
         quota_cooldown=quota_cooldown,
+        usage_store=usage_store,
     )
 
 
@@ -1495,6 +1645,7 @@ class BotApplication:
         store: WatchlistStore,
         signal_store: SignalStore | None = None,
         scanner: DeepSignalScanner | None = None,
+        usage_store: ApiUsageStore | None = None,
         monthly_signal_limit: int = DEFAULT_MONTHLY_SIGNAL_LIMIT,
         signal_cooldown_days: int = DEFAULT_SIGNAL_COOLDOWN_DAYS,
         research_command_cooldown: float = DEFAULT_RESEARCH_COMMAND_COOLDOWN,
@@ -1504,6 +1655,7 @@ class BotApplication:
         self.store = store
         self.signal_store = signal_store
         self.scanner = scanner
+        self.usage_store = usage_store
         self.monthly_signal_limit = monthly_signal_limit
         self.signal_cooldown_days = signal_cooldown_days
         self.research_command_cooldown = max(0.0, float(research_command_cooldown))
@@ -1526,6 +1678,17 @@ class BotApplication:
         return (
             f"Để tránh vượt giới hạn API, /deep và /scan chỉ chạy một lần mỗi phút. "
             f"Hãy thử lại sau {remaining} giây. /ping và /quote vẫn hoạt động bình thường."
+        )
+
+    def _claim_daily_command(self, counter: str, label: str) -> str | None:
+        if self.usage_store is None:
+            return None
+        allowed, used, limit = self.usage_store.claim(counter)
+        if allowed:
+            return None
+        return (
+            f"{label} đã dùng {used}/{limit} lượt (100%) trong ngày. "
+            "Hãy chờ đến 00:00 (UTC+7) hoặc dùng /usage để xem trạng thái."
         )
 
     def handle_update(self, update: dict[str, Any]) -> None:
@@ -1553,6 +1716,15 @@ class BotApplication:
                 return WELCOME if command == "/start" else HELP
             if command == "/ping":
                 return "pong ✅"
+            if command == "/usage":
+                if self.usage_store is None:
+                    return "Bộ đếm API chưa được cấu hình."
+                gemini_status = (
+                    self.scanner.gemini.status_text()
+                    if self.scanner is not None
+                    else "chưa cấu hình"
+                )
+                return self.usage_store.format_status(gemini_status)
             if command == "/quote":
                 argument = _argument(text)
                 if not argument:
@@ -1585,13 +1757,16 @@ class BotApplication:
                 remaining = self._claim_research_slot()
                 if remaining:
                     return self._research_cooldown_message(remaining)
+                daily_limit = self._claim_daily_command("deep_commands", "/deep")
+                if daily_limit:
+                    return daily_limit
                 quote = self.provider.get_quote(symbol)
                 bars = self.provider.get_history(symbol, range_value="1y", interval="1d")
                 snapshot = self.provider.get_fundamentals(symbol)
                 score, reasons = score_candidate(snapshot, quote, bars)
                 scanner = self.scanner or DeepSignalScanner(
                     self.provider,
-                    build_gemini_analyzer(),
+                    build_gemini_analyzer(self.usage_store),
                     [symbol],
                 )
                 return scanner.render_signal(DeepSignal(symbol, score, snapshot, quote, bars, reasons))
@@ -1625,6 +1800,9 @@ class BotApplication:
                 remaining = self._claim_research_slot()
                 if remaining:
                     return self._research_cooldown_message(remaining)
+                daily_limit = self._claim_daily_command("scan_commands", "/scan")
+                if daily_limit:
+                    return daily_limit
                 return self.run_signal_scan(manual=True) or "Không có tín hiệu đủ sâu trong lần quét này."
             if command == "/market":
                 return format_quote(self.provider.get_quote("VNINDEX"))
@@ -1759,17 +1937,33 @@ def build_application() -> BotApplication:
                 str(DEFAULT_RESEARCH_COMMAND_COOLDOWN),
             )
         )
+        gemini_daily_budget = int(
+            os.environ.get("GEMINI_DAILY_BUDGET", DEFAULT_GEMINI_DAILY_BUDGET)
+        )
+        deep_daily_limit = int(
+            os.environ.get("DEEP_DAILY_LIMIT", DEFAULT_DEEP_DAILY_LIMIT)
+        )
+        scan_daily_limit = int(
+            os.environ.get("SCAN_DAILY_LIMIT", DEFAULT_SCAN_DAILY_LIMIT)
+        )
     except ValueError as exc:
         raise ValueError("Các biến timeout/score/limit phải là số.") from exc
     telegram = TelegramClient(token, timeout=max(10.0, poll_timeout + 10.0))
     provider = YahooQuoteProvider(timeout=max(1.0, yahoo_timeout))
-    gemini = build_gemini_analyzer()
+    usage_store = ApiUsageStore(
+        data_dir / "api_usage.json",
+        gemini_daily_budget=gemini_daily_budget,
+        deep_daily_limit=deep_daily_limit,
+        scan_daily_limit=scan_daily_limit,
+    )
+    gemini = build_gemini_analyzer(usage_store)
     symbols = parse_symbols(os.environ.get("VN100_SYMBOLS"))
     return BotApplication(
         telegram=telegram,
         provider=provider,
         store=WatchlistStore(data_dir / "watchlists.json"),
         signal_store=SignalStore(data_dir / "signal_state.json"),
+        usage_store=usage_store,
         scanner=DeepSignalScanner(
             provider=provider,
             gemini=gemini,

@@ -10,6 +10,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bot import (  # noqa: E402
+    ApiUsageStore,
     BotApplication,
     BotError,
     DeepSignal,
@@ -265,6 +266,31 @@ class BotTests(unittest.TestCase):
         self.assertIn("hãy thử lại sau", second)
         self.assertEqual(len(calls), 1)
 
+    def test_gemini_daily_budget_stops_before_extra_api_call(self):
+        calls = []
+
+        class FakeInteractions:
+            def create(self, **kwargs):
+                calls.append(kwargs)
+                return SimpleNamespace(output_text="Phân tích định lượng.", steps=[])
+
+        with tempfile.TemporaryDirectory() as directory:
+            usage = ApiUsageStore(Path(directory) / "usage.json", gemini_daily_budget=1)
+            analyzer = GeminiAnalyzer(
+                "secret",
+                min_interval=0,
+                cache_ttl=0,
+                usage_store=usage,
+                client_factory=lambda _: SimpleNamespace(interactions=FakeInteractions()),
+            )
+            quote = Quote("FPT", "FPT", 100.0, 99.0)
+            snapshot = FundamentalSnapshot("FPT", "FPT")
+            first = analyzer.analyze(DeepSignal("FPT", 70, snapshot, quote, [], []))
+            second = analyzer.analyze(DeepSignal("VNM", 70, snapshot, quote, [], []))
+            self.assertIn("Phân tích định lượng", first)
+            self.assertIn("100% ngân sách an toàn", second)
+            self.assertEqual(len(calls), 1)
+
     def test_gemini_without_key_keeps_quantitative_result(self):
         analyzer = GeminiAnalyzer("")
         quote = Quote("FPT", "FPT Company", 70.0, 72.0)
@@ -295,6 +321,18 @@ class BotTests(unittest.TestCase):
             self.assertEqual(second.get("42"), ["FPT"])
             self.assertTrue(second.remove("42", "FPT")[0])
             self.assertEqual(second.get("42"), [])
+
+    def test_api_usage_is_persisted_and_formats_percentages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "usage.json"
+            first = ApiUsageStore(path, gemini_daily_budget=2, deep_daily_limit=1, scan_daily_limit=1)
+            self.assertTrue(first.claim("gemini_requests")[0])
+            self.assertTrue(first.claim("deep_commands")[0])
+            second = ApiUsageStore(path, gemini_daily_budget=2, deep_daily_limit=1, scan_daily_limit=1)
+            status = second.format_status("đã bật")
+            self.assertIn("Gemini: 1/2", status)
+            self.assertIn("/deep: 1/1", status)
+            self.assertIn("100%", status)
 
     def test_command_router(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -344,6 +382,38 @@ class BotTests(unittest.TestCase):
             self.assertEqual(app.handle_text("/ping", 1), "pong ✅")
             provider.get_quote.assert_called_once()
             scanner.find_candidates.assert_not_called()
+
+    def test_deep_and_scan_daily_limits_are_reported_by_usage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            provider = Mock()
+            provider.get_quote.return_value = Quote("FPT", "FPT", 100.0, 99.0)
+            provider.get_history.return_value = []
+            provider.get_fundamentals.return_value = FundamentalSnapshot("FPT", "FPT")
+            scanner = Mock()
+            scanner.render_signal.return_value = "deep result"
+            scanner.find_candidates.return_value = []
+            scanner.gemini.status_text.return_value = "đã bật"
+            usage = ApiUsageStore(
+                Path(directory) / "usage.json",
+                deep_daily_limit=1,
+                scan_daily_limit=1,
+            )
+            app = BotApplication(
+                telegram=Mock(),
+                provider=provider,
+                store=WatchlistStore(Path(directory) / "watchlists.json"),
+                signal_store=SignalStore(Path(directory) / "signals.json"),
+                scanner=scanner,
+                usage_store=usage,
+                research_command_cooldown=0,
+            )
+            self.assertEqual(app.handle_text("/deep FPT", 1), "deep result")
+            self.assertIn("100%", app.handle_text("/deep VNM", 1))
+            self.assertIn("chưa có mã", app.handle_text("/scan", 1))
+            self.assertIn("100%", app.handle_text("/scan", 1))
+            usage_text = app.handle_text("/usage", 1)
+            self.assertIn("/deep: 1/1", usage_text)
+            self.assertIn("/scan: 1/1", usage_text)
 
     def test_provider_errors_are_user_safe(self):
         with tempfile.TemporaryDirectory() as directory:

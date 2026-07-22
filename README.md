@@ -11,7 +11,8 @@ trên Python 3.10+ và dùng Google Gen AI SDK cho phần nghiên cứu có ki�
 - `/report FPT`: báo cáo nhanh gồm giá, mở cửa, cao/thấp phiên và khối lượng
 - `/chart FPT`: biểu đồ chữ 30 phiên để xem nhanh trong Telegram
 - `/ta FPT`: MA5, MA20, RSI14, hỗ trợ/kháng cự gần
-- `/deep FPT`: phân tích P/E, P/B, chiết khấu 52 tuần; Gemini có thể kiểm tra tin mới bằng Google Search
+  - `/deep FPT`: phân tích P/E, P/B, chiết khấu 52 tuần; Gemini có thể kiểm tra tin mới bằng Google Search
+  - `/usage`: xem phần trăm ngân sách Gemini, `/deep` và `/scan` trong ngày
 - `/signals_on`, `/signals_off`, `/signals_status`: bật/tắt tín hiệu lọc sâu VN100
 - `/scan`: quét VN100 ngay, mặc định chỉ gửi mã đạt ngưỡng đủ sâu
 - `/market`: VN-Index
@@ -97,6 +98,9 @@ Biến cấu hình:
 - `GEMINI_QUOTA_COOLDOWN`: khi gặp 429, ngừng gọi Gemini trong `900` giây
 - `RESEARCH_COMMAND_COOLDOWN`: `/deep` và `/scan` cách nhau ít nhất `60` giây;
   `/ping`, `/quote` và các lệnh thường không bị ảnh hưởng
+- `GEMINI_DAILY_BUDGET`: ngân sách an toàn nội bộ, mặc định `12` API call/ngày
+- `DEEP_DAILY_LIMIT`: tối đa `10` lệnh `/deep` được nhận mỗi ngày
+- `SCAN_DAILY_LIMIT`: tối đa `2` lệnh `/scan` thủ công mỗi ngày
 - `SCAN_WEEKDAYS`: ngày quét, định dạng số thứ trong tuần của Python; mặc định `0,3` là thứ Hai và thứ Năm
 - `SCAN_TIME`: giờ quét theo giờ máy, mặc định `20:30`
 - `SCAN_WORKERS`: mặc định `4`, tối đa nội bộ `12`; worker này chỉ dùng lấy dữ liệu giá
