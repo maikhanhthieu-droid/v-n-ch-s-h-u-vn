@@ -71,9 +71,10 @@ DEFAULT_GEMINI_FALLBACK_MODEL = "gemini-2.5-flash-lite"
 DEFAULT_GEMINI_THINKING_LEVEL = "minimal"
 DEFAULT_GEMINI_MAX_OUTPUT_TOKENS = 1000
 DEFAULT_GEMINI_TIMEOUT = 30
-DEFAULT_GEMINI_MIN_INTERVAL = 4.0
+DEFAULT_GEMINI_MIN_INTERVAL = 60.0
 DEFAULT_GEMINI_CACHE_TTL = 1800
 DEFAULT_GEMINI_QUOTA_COOLDOWN = 900
+DEFAULT_RESEARCH_COMMAND_COOLDOWN = 60.0
 DEFAULT_SCAN_WORKERS = 4
 
 VN100_SYMBOLS = [
@@ -96,6 +97,14 @@ class BotError(RuntimeError):
 
 class GeminiQuotaCircuitOpen(RuntimeError):
     """Raised internally while Gemini calls are paused after a quota error."""
+
+
+class GeminiRequestCooldown(RuntimeError):
+    """Raised internally instead of blocking Telegram during rate limiting."""
+
+    def __init__(self, remaining: float):
+        self.remaining = max(1, int(remaining) + 1)
+        super().__init__(f"Gemini request cooldown: {self.remaining}s")
 
 
 @dataclass(frozen=True)
@@ -834,7 +843,7 @@ class GeminiAnalyzer:
                 raise GeminiQuotaCircuitOpen(f"Gemini quota cooldown: {remaining:.0f}s")
             delay = self.min_interval - (time.monotonic() - self._last_request_at)
             if delay > 0:
-                time.sleep(delay)
+                raise GeminiRequestCooldown(delay)
             self._last_request_at = time.monotonic()
 
     def _cached_result(self, symbol: str) -> str | None:
@@ -860,6 +869,13 @@ class GeminiAnalyzer:
         return (
             "Gemini đang tạm nghỉ do vượt giới hạn API; bot chỉ gửi phần chấm điểm "
             "định lượng. Hệ thống sẽ tự thử lại sau thời gian cooldown."
+        )
+
+    @staticmethod
+    def _rate_message(remaining: int) -> str:
+        return (
+            f"Gemini đang giới hạn nhịp để bảo vệ quota; hãy thử lại sau {remaining} giây. "
+            "Bot vẫn gửi phần chấm điểm định lượng."
         )
 
     def status_text(self) -> str:
@@ -1045,6 +1061,8 @@ class GeminiAnalyzer:
             result = self._analyze_interactions(prompt, use_search=search_attempted)
             self._store_cached_result(signal.symbol, result)
             return result
+        except GeminiRequestCooldown as cooldown_exc:
+            return self._rate_message(cooldown_exc.remaining)
         except GeminiQuotaCircuitOpen:
             return self._quota_message()
         except Exception as primary_exc:  # SDK/API failures must not stop Telegram polling.
@@ -1084,6 +1102,8 @@ class GeminiAnalyzer:
             result = fallback_text + suffix
             self._store_cached_result(signal.symbol, result)
             return result
+        except GeminiRequestCooldown as cooldown_exc:
+            return self._rate_message(cooldown_exc.remaining)
         except GeminiQuotaCircuitOpen:
             return self._quota_message()
         except Exception as fallback_exc:
@@ -1477,6 +1497,7 @@ class BotApplication:
         scanner: DeepSignalScanner | None = None,
         monthly_signal_limit: int = DEFAULT_MONTHLY_SIGNAL_LIMIT,
         signal_cooldown_days: int = DEFAULT_SIGNAL_COOLDOWN_DAYS,
+        research_command_cooldown: float = DEFAULT_RESEARCH_COMMAND_COOLDOWN,
     ):
         self.telegram = telegram
         self.provider = provider
@@ -1485,6 +1506,27 @@ class BotApplication:
         self.scanner = scanner
         self.monthly_signal_limit = monthly_signal_limit
         self.signal_cooldown_days = signal_cooldown_days
+        self.research_command_cooldown = max(0.0, float(research_command_cooldown))
+        self._research_last_started_at = 0.0
+        self._research_lock = threading.Lock()
+
+    def _claim_research_slot(self) -> int:
+        with self._research_lock:
+            now = time.monotonic()
+            remaining = self.research_command_cooldown - (
+                now - self._research_last_started_at
+            )
+            if remaining > 0:
+                return max(1, int(remaining) + 1)
+            self._research_last_started_at = now
+            return 0
+
+    @staticmethod
+    def _research_cooldown_message(remaining: int) -> str:
+        return (
+            f"Để tránh vượt giới hạn API, /deep và /scan chỉ chạy một lần mỗi phút. "
+            f"Hãy thử lại sau {remaining} giây. /ping và /quote vẫn hoạt động bình thường."
+        )
 
     def handle_update(self, update: dict[str, Any]) -> None:
         message = update.get("message") if isinstance(update, dict) else None
@@ -1540,6 +1582,9 @@ class BotApplication:
                 if not argument:
                     return "Dùng: /deep <mã>, ví dụ /deep FPT"
                 symbol = normalize_symbol(argument.split()[0])
+                remaining = self._claim_research_slot()
+                if remaining:
+                    return self._research_cooldown_message(remaining)
                 quote = self.provider.get_quote(symbol)
                 bars = self.provider.get_history(symbol, range_value="1y", interval="1d")
                 snapshot = self.provider.get_fundamentals(symbol)
@@ -1577,6 +1622,9 @@ class BotApplication:
                     f"Lần quét cuối: {self.signal_store.last_scan_date() or 'chưa có'}"
                 )
             if command == "/scan":
+                remaining = self._claim_research_slot()
+                if remaining:
+                    return self._research_cooldown_message(remaining)
                 return self.run_signal_scan(manual=True) or "Không có tín hiệu đủ sâu trong lần quét này."
             if command == "/market":
                 return format_quote(self.provider.get_quote("VNINDEX"))
@@ -1705,6 +1753,12 @@ def build_application() -> BotApplication:
         monthly_signal_limit = int(os.environ.get("MONTHLY_SIGNAL_LIMIT", DEFAULT_MONTHLY_SIGNAL_LIMIT))
         signal_cooldown_days = int(os.environ.get("SIGNAL_COOLDOWN_DAYS", DEFAULT_SIGNAL_COOLDOWN_DAYS))
         scan_workers = int(os.environ.get("SCAN_WORKERS", DEFAULT_SCAN_WORKERS))
+        research_command_cooldown = float(
+            os.environ.get(
+                "RESEARCH_COMMAND_COOLDOWN",
+                str(DEFAULT_RESEARCH_COMMAND_COOLDOWN),
+            )
+        )
     except ValueError as exc:
         raise ValueError("Các biến timeout/score/limit phải là số.") from exc
     telegram = TelegramClient(token, timeout=max(10.0, poll_timeout + 10.0))
@@ -1726,6 +1780,7 @@ def build_application() -> BotApplication:
         ),
         monthly_signal_limit=monthly_signal_limit,
         signal_cooldown_days=signal_cooldown_days,
+        research_command_cooldown=research_command_cooldown,
     )
 
 

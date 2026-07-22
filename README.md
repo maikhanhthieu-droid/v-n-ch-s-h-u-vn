@@ -91,9 +91,12 @@ Biến cấu hình:
 - `GEMINI_MAX_OUTPUT_TOKENS`: mặc định `1000`
 - `GEMINI_GOOGLE_SEARCH`: mặc định `false`; chỉ bật khi project có đủ quota grounding
 - `GEMINI_TIMEOUT`: mặc định `30` giây
-- `GEMINI_MIN_INTERVAL`: tối thiểu `4` giây giữa hai yêu cầu Gemini
+- `GEMINI_MIN_INTERVAL`: tối thiểu `60` giây giữa hai yêu cầu Gemini; bot trả
+  thông báo cooldown ngay thay vì đứng chờ
 - `GEMINI_CACHE_TTL`: cache kết quả mỗi mã trong `1800` giây
 - `GEMINI_QUOTA_COOLDOWN`: khi gặp 429, ngừng gọi Gemini trong `900` giây
+- `RESEARCH_COMMAND_COOLDOWN`: `/deep` và `/scan` cách nhau ít nhất `60` giây;
+  `/ping`, `/quote` và các lệnh thường không bị ảnh hưởng
 - `SCAN_WEEKDAYS`: ngày quét, định dạng số thứ trong tuần của Python; mặc định `0,3` là thứ Hai và thứ Năm
 - `SCAN_TIME`: giờ quét theo giờ máy, mặc định `20:30`
 - `SCAN_WORKERS`: mặc định `4`, tối đa nội bộ `12`; worker này chỉ dùng lấy dữ liệu giá

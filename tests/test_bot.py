@@ -243,6 +243,28 @@ class BotTests(unittest.TestCase):
         self.assertIn("model dự phòng", first)
         self.assertIn("cache", second)
 
+    def test_gemini_min_interval_returns_immediately_without_second_call(self):
+        calls = []
+
+        class FakeInteractions:
+            def create(self, **kwargs):
+                calls.append(kwargs)
+                return SimpleNamespace(output_text="Phân tích định lượng.", steps=[])
+
+        analyzer = GeminiAnalyzer(
+            "secret",
+            min_interval=60,
+            cache_ttl=0,
+            client_factory=lambda _: SimpleNamespace(interactions=FakeInteractions()),
+        )
+        quote = Quote("FPT", "FPT", 100.0, 99.0)
+        snapshot = FundamentalSnapshot("FPT", "FPT")
+        first = analyzer.analyze(DeepSignal("FPT", 70, snapshot, quote, [], []))
+        second = analyzer.analyze(DeepSignal("VNM", 70, snapshot, quote, [], []))
+        self.assertIn("Phân tích định lượng", first)
+        self.assertIn("hãy thử lại sau", second)
+        self.assertEqual(len(calls), 1)
+
     def test_gemini_without_key_keeps_quantitative_result(self):
         analyzer = GeminiAnalyzer("")
         quote = Quote("FPT", "FPT Company", 70.0, 72.0)
@@ -299,6 +321,29 @@ class BotTests(unittest.TestCase):
                 {"update_id": 1, "message": {"chat": {"id": 1}, "text": "/ping"}}
             )
             telegram.send_message.assert_called_once_with(1, "pong ✅")
+
+    def test_deep_and_scan_share_nonblocking_command_cooldown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            provider = Mock()
+            provider.get_quote.return_value = Quote("FPT", "FPT", 100.0, 99.0)
+            provider.get_history.return_value = []
+            provider.get_fundamentals.return_value = FundamentalSnapshot("FPT", "FPT")
+            scanner = Mock()
+            scanner.render_signal.return_value = "deep result"
+            app = BotApplication(
+                telegram=Mock(),
+                provider=provider,
+                store=WatchlistStore(Path(directory) / "watchlists.json"),
+                signal_store=SignalStore(Path(directory) / "signals.json"),
+                scanner=scanner,
+                research_command_cooldown=60,
+            )
+            self.assertEqual(app.handle_text("/deep FPT", 1), "deep result")
+            blocked = app.handle_text("/scan", 1)
+            self.assertIn("chỉ chạy một lần mỗi phút", blocked)
+            self.assertEqual(app.handle_text("/ping", 1), "pong ✅")
+            provider.get_quote.assert_called_once()
+            scanner.find_candidates.assert_not_called()
 
     def test_provider_errors_are_user_safe(self):
         with tempfile.TemporaryDirectory() as directory:
