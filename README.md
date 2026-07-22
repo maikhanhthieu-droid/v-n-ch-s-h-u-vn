@@ -85,17 +85,18 @@ Lệnh Telegram:
 Biến cấu hình:
 
 - `GEMINI_API_KEY`: key Gemini thật; nếu thiếu, bot vẫn gửi điểm định lượng
-- `GEMINI_MODEL`: mặc định `gemini-3-flash-preview`
-- `GEMINI_FALLBACK_MODEL`: mặc định `gemini-3.5-flash`
-- `GEMINI_THINKING_LEVEL`: mặc định `high`
-- `GEMINI_MAX_OUTPUT_TOKENS`: mặc định `3000`; không cần `65536` cho Telegram
-- `GEMINI_GOOGLE_SEARCH`: mặc định `true`, gắn tối đa 3 nguồn kiểm chứng; nếu
-  project bị giới hạn grounding/quota, bot tự chuyển sang phân tích không web
-  trong 1 giờ để không làm hỏng tín hiệu
-- `GEMINI_TIMEOUT`: mặc định `45` giây
+- `GEMINI_MODEL`: mặc định `gemini-3.5-flash-lite`
+- `GEMINI_FALLBACK_MODEL`: mặc định `gemini-2.5-flash-lite`
+- `GEMINI_THINKING_LEVEL`: mặc định `minimal`
+- `GEMINI_MAX_OUTPUT_TOKENS`: mặc định `1000`
+- `GEMINI_GOOGLE_SEARCH`: mặc định `false`; chỉ bật khi project có đủ quota grounding
+- `GEMINI_TIMEOUT`: mặc định `30` giây
+- `GEMINI_MIN_INTERVAL`: tối thiểu `4` giây giữa hai yêu cầu Gemini
+- `GEMINI_CACHE_TTL`: cache kết quả mỗi mã trong `1800` giây
+- `GEMINI_QUOTA_COOLDOWN`: khi gặp 429, ngừng gọi Gemini trong `900` giây
 - `SCAN_WEEKDAYS`: ngày quét, định dạng số thứ trong tuần của Python; mặc định `0,3` là thứ Hai và thứ Năm
 - `SCAN_TIME`: giờ quét theo giờ máy, mặc định `20:30`
-- `SCAN_WORKERS`: mặc định `6`, tối đa nội bộ `12`
+- `SCAN_WORKERS`: mặc định `4`, tối đa nội bộ `12`; worker này chỉ dùng lấy dữ liệu giá
 - `MONTHLY_SIGNAL_LIMIT`: mặc định `2`
 - `MAX_SIGNALS_PER_SCAN`: mặc định `2`
 - `MIN_SIGNAL_SCORE`: mặc định `70`
@@ -116,6 +117,10 @@ python -m unittest discover -s tests -v
 chạy `python bot.py`. Không commit `.env` hoặc token vào GitHub. Nếu dùng GitHub
 Actions, hãy chạy một worker dài hạn bên ngoài Actions; workflow miễn phí không
 phù hợp để giữ long polling liên tục.
+
+Mỗi lệnh chỉ gọi Gemini tối đa hai lần (model chính và một model dự phòng). Khi
+gặp lỗi quota 429, bot mở circuit breaker và vẫn trả kết quả định lượng thay vì
+tiếp tục retry. Các lệnh `/start`, `/ping`, `/quote` không phụ thuộc Gemini.
 
 ## Phạm vi hiện tại
 

@@ -143,6 +143,9 @@ class BotTests(unittest.TestCase):
         analyzer = GeminiAnalyzer(
             "secret",
             model="models/gemini-3-flash-preview",
+            thinking_level="high",
+            use_google_search=True,
+            min_interval=0,
             client_factory=lambda _: fake_client,
         )
         quote = Quote("FPT", "FPT Company", 70.0, 72.0)
@@ -161,18 +164,19 @@ class BotTests(unittest.TestCase):
         self.assertEqual(captured["model"], "gemini-3-flash-preview")
         self.assertEqual(captured["tools"], [{"type": "google_search"}])
         self.assertEqual(captured["generation_config"]["thinking_level"], "high")
-        self.assertEqual(captured["generation_config"]["temperature"], 1.0)
+        self.assertNotIn("temperature", captured["generation_config"])
+        self.assertNotIn("top_p", captured["generation_config"])
         self.assertFalse(captured["store"])
         self.assertIn("https://example.com/report", rendered)
 
-    def test_gemini_falls_back_without_search_when_grounding_is_limited(self):
+    def test_gemini_opens_circuit_without_retrying_on_quota(self):
         calls = []
 
         class FakeInteractions:
             def create(self, **kwargs):
                 calls.append(kwargs)
                 if kwargs.get("tools"):
-                    raise RuntimeError("429")
+                    raise RuntimeError("429 RESOURCE_EXHAUSTED")
                 return SimpleNamespace(
                     output_text="Định giá: dựa trên số liệu đầu vào.",
                     steps=[],
@@ -180,6 +184,9 @@ class BotTests(unittest.TestCase):
 
         analyzer = GeminiAnalyzer(
             "secret",
+            use_google_search=True,
+            min_interval=0,
+            quota_cooldown=600,
             client_factory=lambda _: SimpleNamespace(interactions=FakeInteractions()),
         )
         quote = Quote("HPG", "Hoa Phat", 21_850.0, 22_000.0)
@@ -193,11 +200,48 @@ class BotTests(unittest.TestCase):
         rendered = analyzer.analyze(
             DeepSignal("HPG", 85, snapshot, quote, [], ["P/E thấp"])
         )
+        self.assertEqual(len(calls), 1)
+        self.assertIn("tạm nghỉ do vượt giới hạn API", rendered)
+        self.assertIn("tạm nghỉ do quota", analyzer.status_text())
+        analyzer.analyze(DeepSignal("FPT", 80, snapshot, quote, [], []))
+        self.assertEqual(len(calls), 1)
+
+    def test_gemini_uses_one_fallback_and_caches_success(self):
+        calls = []
+
+        class FakeInteractions:
+            def create(self, **kwargs):
+                calls.append(kwargs)
+                if kwargs.get("tools"):
+                    raise RuntimeError("grounding unavailable")
+                return SimpleNamespace(
+                    output_text="Định giá: dựa trên số liệu định lượng.",
+                    steps=[],
+                )
+
+        analyzer = GeminiAnalyzer(
+            "secret",
+            use_google_search=True,
+            min_interval=0,
+            cache_ttl=600,
+            client_factory=lambda _: SimpleNamespace(interactions=FakeInteractions()),
+        )
+        quote = Quote("HPG", "Hoa Phat", 21_850.0, 22_000.0)
+        snapshot = FundamentalSnapshot(
+            "HPG",
+            "Hoa Phat",
+            price=21_850.0,
+            trailing_pe=8.4,
+            price_to_book=1.33,
+        )
+        signal = DeepSignal("HPG", 85, snapshot, quote, [], ["P/E thấp"])
+        first = analyzer.analyze(signal)
+        second = analyzer.analyze(signal)
         self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["model"], analyzer.fallback_model)
         self.assertIsNone(calls[1]["tools"])
-        self.assertIn("Google Search đang tạm thời bị giới hạn", rendered)
-        self.assertIn("không được tự đưa tin", calls[1]["input"])
-        self.assertIn("quota giới hạn", analyzer.status_text())
+        self.assertIn("model dự phòng", first)
+        self.assertIn("cache", second)
 
     def test_gemini_without_key_keeps_quantitative_result(self):
         analyzer = GeminiAnalyzer("")

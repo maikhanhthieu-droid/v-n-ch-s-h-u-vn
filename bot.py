@@ -39,6 +39,7 @@ import re
 import signal
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -65,12 +66,15 @@ DEFAULT_SCAN_WEEKDAYS = "0,3"
 DEFAULT_SCAN_TIME = "20:30"
 DEFAULT_MONTHLY_SIGNAL_LIMIT = 2
 DEFAULT_SIGNAL_COOLDOWN_DAYS = 30
-DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
-DEFAULT_GEMINI_FALLBACK_MODEL = "gemini-3.5-flash"
-DEFAULT_GEMINI_THINKING_LEVEL = "high"
-DEFAULT_GEMINI_MAX_OUTPUT_TOKENS = 3000
-DEFAULT_GEMINI_TIMEOUT = 45
-DEFAULT_SCAN_WORKERS = 6
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_GEMINI_FALLBACK_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_GEMINI_THINKING_LEVEL = "minimal"
+DEFAULT_GEMINI_MAX_OUTPUT_TOKENS = 1000
+DEFAULT_GEMINI_TIMEOUT = 30
+DEFAULT_GEMINI_MIN_INTERVAL = 4.0
+DEFAULT_GEMINI_CACHE_TTL = 1800
+DEFAULT_GEMINI_QUOTA_COOLDOWN = 900
+DEFAULT_SCAN_WORKERS = 4
 
 VN100_SYMBOLS = [
     "AAA", "ACB", "ANV", "APH", "ASM", "BCM", "BID", "BMP", "BSI", "BVH",
@@ -88,6 +92,10 @@ VN100_SYMBOLS = [
 
 class BotError(RuntimeError):
     """A user-safe error returned by an upstream service."""
+
+
+class GeminiQuotaCircuitOpen(RuntimeError):
+    """Raised internally while Gemini calls are paused after a quota error."""
 
 
 @dataclass(frozen=True)
@@ -754,8 +762,11 @@ class GeminiAnalyzer:
         fallback_model: str = DEFAULT_GEMINI_FALLBACK_MODEL,
         thinking_level: str = DEFAULT_GEMINI_THINKING_LEVEL,
         max_output_tokens: int = DEFAULT_GEMINI_MAX_OUTPUT_TOKENS,
-        use_google_search: bool = True,
+        use_google_search: bool = False,
         timeout: float = DEFAULT_GEMINI_TIMEOUT,
+        min_interval: float = DEFAULT_GEMINI_MIN_INTERVAL,
+        cache_ttl: float = DEFAULT_GEMINI_CACHE_TTL,
+        quota_cooldown: float = DEFAULT_GEMINI_QUOTA_COOLDOWN,
         client_factory: Callable[[str], Any] | None = None,
     ):
         self.api_key = api_key.strip()
@@ -769,8 +780,16 @@ class GeminiAnalyzer:
         self.max_output_tokens = max(200, min(int(max_output_tokens), 4096))
         self.use_google_search = bool(use_google_search)
         self.timeout = max(5.0, float(timeout))
+        self.min_interval = max(0.0, float(min_interval))
+        self.cache_ttl = max(0.0, float(cache_ttl))
+        self.quota_cooldown = max(60.0, float(quota_cooldown))
         self._client_factory = client_factory
         self._search_disabled_until = 0.0
+        self._quota_disabled_until = 0.0
+        self._last_request_at = 0.0
+        self._state_lock = threading.Lock()
+        self._request_lock = threading.Lock()
+        self._cache: dict[str, tuple[float, str]] = {}
 
     @staticmethod
     def _normalize_model(model: str, default: str) -> str:
@@ -782,9 +801,73 @@ class GeminiAnalyzer:
     def enabled(self) -> bool:
         return bool(self.api_key)
 
+    @staticmethod
+    def _is_quota_error(exc: BaseException) -> bool:
+        status_values = [
+            getattr(exc, "code", None),
+            getattr(exc, "status_code", None),
+            getattr(getattr(exc, "response", None), "status_code", None),
+        ]
+        if any(str(value) == "429" for value in status_values if value is not None):
+            return True
+        message = f"{type(exc).__name__}: {exc}".lower()
+        return any(
+            marker in message
+            for marker in ("429", "resource_exhausted", "resource exhausted", "quota exceeded")
+        )
+
+    def _open_quota_circuit(self) -> None:
+        with self._state_lock:
+            self._quota_disabled_until = max(
+                self._quota_disabled_until,
+                time.monotonic() + self.quota_cooldown,
+            )
+
+    def _quota_remaining(self) -> float:
+        with self._state_lock:
+            return max(0.0, self._quota_disabled_until - time.monotonic())
+
+    def _reserve_request_slot(self) -> None:
+        with self._request_lock:
+            remaining = self._quota_remaining()
+            if remaining > 0:
+                raise GeminiQuotaCircuitOpen(f"Gemini quota cooldown: {remaining:.0f}s")
+            delay = self.min_interval - (time.monotonic() - self._last_request_at)
+            if delay > 0:
+                time.sleep(delay)
+            self._last_request_at = time.monotonic()
+
+    def _cached_result(self, symbol: str) -> str | None:
+        now = time.monotonic()
+        with self._state_lock:
+            cached = self._cache.get(symbol)
+            if cached is None:
+                return None
+            expires_at, text = cached
+            if expires_at <= now:
+                self._cache.pop(symbol, None)
+                return None
+            return text
+
+    def _store_cached_result(self, symbol: str, text: str) -> None:
+        if self.cache_ttl <= 0:
+            return
+        with self._state_lock:
+            self._cache[symbol] = (time.monotonic() + self.cache_ttl, text)
+
+    @staticmethod
+    def _quota_message() -> str:
+        return (
+            "Gemini đang tạm nghỉ do vượt giới hạn API; bot chỉ gửi phần chấm điểm "
+            "định lượng. Hệ thống sẽ tự thử lại sau thời gian cooldown."
+        )
+
     def status_text(self) -> str:
         if not self.enabled():
             return "chưa có API key"
+        quota_remaining = self._quota_remaining()
+        if quota_remaining > 0:
+            return f"tạm nghỉ do quota, thử lại sau khoảng {max(1, int(quota_remaining / 60) + 1)} phút"
         if self.use_google_search and time.monotonic() < self._search_disabled_until:
             search = "Search đang bị quota giới hạn, dùng fallback số liệu"
         elif self.use_google_search:
@@ -840,7 +923,11 @@ class GeminiAnalyzer:
             return self._client_factory(self.api_key)
         if genai is None:
             raise RuntimeError("google-genai chưa được cài đặt")
-        return genai.Client(api_key=self.api_key)
+        # The application owns retry/fallback decisions. Keep the SDK from
+        # multiplying a single Telegram command into several quota failures.
+        retry_options = genai.types.HttpRetryOptions(attempts=1)
+        http_options = genai.types.HttpOptions(retry_options=retry_options)
+        return genai.Client(api_key=self.api_key, http_options=http_options)
 
     @staticmethod
     def _extract_interaction(interaction: Any) -> tuple[str, list[tuple[str, str]]]:
@@ -890,6 +977,7 @@ class GeminiAnalyzer:
         use_search: bool | None = None,
         model: str | None = None,
     ) -> str:
+        self._reserve_request_slot()
         client = self._create_client()
         if use_search is None:
             use_search = self.use_google_search and time.monotonic() >= self._search_disabled_until
@@ -899,9 +987,7 @@ class GeminiAnalyzer:
             input=prompt,
             tools=tools,
             generation_config={
-                "temperature": 1.0,
                 "max_output_tokens": self.max_output_tokens,
-                "top_p": 0.95,
                 "thinking_level": self.thinking_level,
             },
             store=False,
@@ -913,6 +999,7 @@ class GeminiAnalyzer:
         return self._with_sources(text, sources)
 
     def _analyze_legacy_fallback(self, prompt: str) -> str:
+        self._reserve_request_slot()
         endpoint = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
             f"{url_quote(self.fallback_model, safe='')}:generateContent"
@@ -920,9 +1007,7 @@ class GeminiAnalyzer:
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
-                "temperature": 1.0,
                 "maxOutputTokens": min(self.max_output_tokens, 1200),
-                "topP": 0.95,
             },
         }
         request = Request(
@@ -947,10 +1032,21 @@ class GeminiAnalyzer:
     def analyze(self, signal: DeepSignal) -> str:
         if not self.enabled():
             return "Gemini chưa có API key; bot đang dùng phần chấm điểm định lượng."
+
+        cached = self._cached_result(signal.symbol)
+        if cached is not None:
+            return cached + "\n\n(Kết quả Gemini được lấy từ cache để tiết kiệm quota.)"
+        if self._quota_remaining() > 0:
+            return self._quota_message()
+
         search_attempted = self.use_google_search and time.monotonic() >= self._search_disabled_until
         prompt = self._build_prompt(signal, allow_search=search_attempted)
         try:
-            return self._analyze_interactions(prompt, use_search=search_attempted)
+            result = self._analyze_interactions(prompt, use_search=search_attempted)
+            self._store_cached_result(signal.symbol, result)
+            return result
+        except GeminiQuotaCircuitOpen:
+            return self._quota_message()
         except Exception as primary_exc:  # SDK/API failures must not stop Telegram polling.
             LOG.warning(
                 "Gemini Interactions failed for %s with model %s: %s",
@@ -958,59 +1054,48 @@ class GeminiAnalyzer:
                 self.model,
                 type(primary_exc).__name__,
             )
-            if search_attempted:
-                # Google Search grounding is unavailable on some free-tier
-                # projects. Keep the AI analysis useful and avoid retry storms.
-                self._search_disabled_until = time.monotonic() + 3600.0
-                try:
-                    offline_prompt = self._build_prompt(signal, allow_search=False)
-                    fallback_text = self._analyze_interactions(offline_prompt, use_search=False)
-                    return (
-                        fallback_text
-                        + "\n\n(Google Search đang tạm thời bị giới hạn; "
-                        "phần trên dựa trên dữ liệu định lượng đã cung cấp.)"
-                    )
-                except Exception as no_search_exc:
-                    LOG.warning(
-                        "Gemini no-search fallback failed for %s: %s",
-                        signal.symbol,
-                        type(no_search_exc).__name__,
-                    )
-                    try:
-                        fallback_text = self._analyze_interactions(
-                            offline_prompt,
-                            use_search=False,
-                            model=self.fallback_model,
-                        )
-                        return fallback_text + "\n\n(Gemini đang dùng model dự phòng.)"
-                    except Exception as model_fallback_exc:
-                        LOG.warning(
-                            "Gemini model fallback failed for %s: %s",
-                            signal.symbol,
-                            type(model_fallback_exc).__name__,
-                        )
+            if self._is_quota_error(primary_exc):
+                self._open_quota_circuit()
+                LOG.warning(
+                    "Gemini quota circuit opened for %.0f seconds.",
+                    self.quota_cooldown,
+                )
+                return self._quota_message()
+
+        if search_attempted:
+            self._search_disabled_until = time.monotonic() + 3600.0
+
+        # One fallback only. A quota error never enters this route, preventing
+        # the old retry cascade (Search -> no Search -> model -> REST).
+        offline_prompt = self._build_prompt(signal, allow_search=False)
         try:
-            return self._analyze_legacy_fallback(
-                self._build_prompt(signal, allow_search=False)
+            if genai is None and self._client_factory is None:
+                fallback_text = self._analyze_legacy_fallback(offline_prompt)
+            else:
+                fallback_text = self._analyze_interactions(
+                    offline_prompt,
+                    use_search=False,
+                    model=self.fallback_model,
+                )
+            suffix = (
+                "\n\n(Google Search không khả dụng; Gemini đang dùng model dự phòng "
+                "với dữ liệu định lượng.)"
             )
-        except (
-            HTTPError,
-            URLError,
-            TimeoutError,
-            OSError,
-            KeyError,
-            IndexError,
-            TypeError,
-            ValueError,
-            json.JSONDecodeError,
-            RuntimeError,
-        ) as fallback_exc:
+            result = fallback_text + suffix
+            self._store_cached_result(signal.symbol, result)
+            return result
+        except GeminiQuotaCircuitOpen:
+            return self._quota_message()
+        except Exception as fallback_exc:
             LOG.warning(
                 "Gemini fallback failed for %s with model %s: %s",
                 signal.symbol,
                 self.fallback_model,
                 type(fallback_exc).__name__,
             )
+            if self._is_quota_error(fallback_exc):
+                self._open_quota_circuit()
+                return self._quota_message()
             return "Gemini không phản hồi lúc này; bot chỉ gửi phần chấm điểm định lượng."
 
 
@@ -1336,8 +1421,17 @@ def build_gemini_analyzer() -> GeminiAnalyzer:
             )
         )
         timeout = float(os.environ.get("GEMINI_TIMEOUT", str(DEFAULT_GEMINI_TIMEOUT)))
+        min_interval = float(
+            os.environ.get("GEMINI_MIN_INTERVAL", str(DEFAULT_GEMINI_MIN_INTERVAL))
+        )
+        cache_ttl = float(
+            os.environ.get("GEMINI_CACHE_TTL", str(DEFAULT_GEMINI_CACHE_TTL))
+        )
+        quota_cooldown = float(
+            os.environ.get("GEMINI_QUOTA_COOLDOWN", str(DEFAULT_GEMINI_QUOTA_COOLDOWN))
+        )
     except ValueError as exc:
-        raise ValueError("GEMINI_MAX_OUTPUT_TOKENS/GEMINI_TIMEOUT phải là số.") from exc
+        raise ValueError("Các biến GEMINI_* timeout/token/interval/cache/cooldown phải là số.") from exc
     return GeminiAnalyzer(
         os.environ.get("GEMINI_API_KEY", ""),
         model=os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
@@ -1350,8 +1444,11 @@ def build_gemini_analyzer() -> GeminiAnalyzer:
             DEFAULT_GEMINI_THINKING_LEVEL,
         ),
         max_output_tokens=max_tokens,
-        use_google_search=parse_bool(os.environ.get("GEMINI_GOOGLE_SEARCH"), True),
+        use_google_search=parse_bool(os.environ.get("GEMINI_GOOGLE_SEARCH"), False),
         timeout=timeout,
+        min_interval=min_interval,
+        cache_ttl=cache_ttl,
+        quota_cooldown=quota_cooldown,
     )
 
 
