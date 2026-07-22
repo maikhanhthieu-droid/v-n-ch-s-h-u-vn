@@ -34,6 +34,7 @@ import argparse
 import html
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -78,7 +79,13 @@ DEFAULT_RESEARCH_COMMAND_COOLDOWN = 60.0
 DEFAULT_GEMINI_DAILY_BUDGET = 12
 DEFAULT_DEEP_DAILY_LIMIT = 10
 DEFAULT_SCAN_DAILY_LIMIT = 2
-DEFAULT_SCAN_WORKERS = 4
+DEFAULT_SCAN_WORKERS = 2
+DEFAULT_VNSTOCK_DAILY_BUDGET = 60
+DEFAULT_VNSTOCK_REQUESTS_PER_MINUTE = 12
+DEFAULT_VNSTOCK_USAGE_RATIO = 0.70
+DEFAULT_VNSTOCK_ERROR_COOLDOWN = 300.0
+DEFAULT_VNSTOCK_CACHE_TTL = 480.0
+DEFAULT_VNSTOCK_SOURCES = "VCI,KBS"
 
 VN100_SYMBOLS = [
     "AAA", "ACB", "ANV", "APH", "ASM", "BCM", "BID", "BMP", "BSI", "BVH",
@@ -443,6 +450,356 @@ class YahooQuoteProvider:
         return snapshots
 
 
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "429",
+            "too many request",
+            "rate limit",
+            "ratelimit",
+            "quota",
+            "exceeded",
+            "temporarily blocked",
+        )
+    )
+
+
+def _is_unsupported_source_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return (
+        "provider 'quote/" in text
+        or ("available:" in text and "quote" in text)
+        or ("source" in text and ("unsupported" in text or "not support" in text))
+    )
+
+
+def _history_window(range_value: str) -> tuple[str, str]:
+    """Translate Yahoo-style ranges into vnstock start/end dates."""
+
+    normalized = str(range_value or "6mo").strip().lower()
+    days_by_range = {
+        "1mo": 45,
+        "3mo": 120,
+        "6mo": 220,
+        "1y": 380,
+        "2y": 760,
+        "5y": 1900,
+    }
+    days = days_by_range.get(normalized, 220)
+    now = datetime.now()
+    end = now.strftime("%Y-%m-%d")
+    start = datetime.fromtimestamp(now.timestamp() - days * 86400).strftime("%Y-%m-%d")
+    return start, end
+
+
+def _vnstock_bars(raw: Any, symbol: str) -> list[PriceBar]:
+    """Normalize a vnstock DataFrame without binding the bot to pandas APIs."""
+
+    if raw is None:
+        return []
+    try:
+        records = raw.to_dict("records") if hasattr(raw, "to_dict") else list(raw)
+    except (TypeError, ValueError):
+        return []
+    parsed: list[dict[str, float | int | None]] = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        row = {str(key).lower(): value for key, value in item.items()}
+        def finite_number(*values: Any) -> float | None:
+            value = _first_number(*values)
+            return value if value is not None and math.isfinite(value) else None
+
+        close = finite_number(row.get("close"), row.get("c"))
+        if close is None:
+            continue
+        volume = finite_number(row.get("volume"), row.get("v"))
+        parsed.append(
+            {
+                "close": close,
+                "high": finite_number(row.get("high"), row.get("h")),
+                "low": finite_number(row.get("low"), row.get("l")),
+                "open": finite_number(row.get("open"), row.get("o")),
+                "volume": int(volume) if volume is not None else None,
+            }
+        )
+    if len(parsed) < 2:
+        return []
+
+    # vnstock commonly reports Vietnamese shares in thousands of VND while
+    # Yahoo/TradingView report VND. Keep one unit throughout the bot.
+    is_index = symbol.upper() in {"VNINDEX", "VN30", "HNXINDEX", "UPCOMINDEX"}
+    scale = 1.0
+    if not is_index and max(abs(float(row["close"])) for row in parsed) < 10_000:
+        scale = 1000.0
+
+    def scaled(value: float | int | None) -> float | None:
+        return float(value) * scale if value is not None else None
+
+    return [
+        PriceBar(
+            close=float(row["close"]) * scale,
+            high=scaled(row["high"]),
+            low=scaled(row["low"]),
+            open_price=scaled(row["open"]),
+            volume=int(row["volume"]) if row["volume"] is not None else None,
+        )
+        for row in parsed
+    ]
+
+
+class VnstockHistoryClient:
+    """Thin compatibility layer for vnstock import-path changes."""
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key.strip()
+        if self.api_key:
+            os.environ.setdefault("VNSTOCK_API_KEY", self.api_key)
+            os.environ.setdefault("VNDATA_API_KEY", self.api_key)
+        try:
+            from vnstock.api.quote import Quote as vn_quote
+        except ImportError:
+            try:
+                from vnstock import Quote as vn_quote
+            except ImportError as exc:
+                raise RuntimeError("Thư viện vnstock chưa được cài đặt.") from exc
+        self._quote_class = vn_quote
+
+    def fetch(
+        self,
+        source: str,
+        symbol: str,
+        range_value: str,
+        interval: str,
+    ) -> list[PriceBar]:
+        start, end = _history_window(range_value)
+        vn_interval = "1D" if interval.lower() in {"1d", "d", "day"} else interval
+        quote = self._quote_class(symbol=symbol.upper(), source=source.lower())
+        raw = quote.history(start=start, end=end, interval=vn_interval)
+        bars = _vnstock_bars(raw, symbol)
+        if len(bars) < 2:
+            raise ValueError(f"vnstock {source} returned insufficient OHLCV for {symbol}")
+        return bars
+
+
+class VnstockSourceGate:
+    """Per-source throttle and circuit breaker inspired by THIUCUBU."""
+
+    def __init__(
+        self,
+        source: str,
+        requests_per_minute: int,
+        usage_ratio: float,
+        error_cooldown: float,
+    ):
+        self.source = source
+        self.rpm_limit = max(1, int(requests_per_minute))
+        self.usage_ratio = max(0.05, min(1.0, float(usage_ratio)))
+        self.effective_rpm = self.rpm_limit * self.usage_ratio
+        self.min_interval = 60.0 / self.effective_rpm
+        self.error_cooldown = max(30.0, float(error_cooldown))
+        self.next_at = 0.0
+        self.cooldown_until = 0.0
+        self.attempts = 0
+        self.successes = 0
+        self.failures = 0
+        self.rate_limit_failures = 0
+        self.disabled = False
+        self.last_error = ""
+        self._lock = threading.Lock()
+
+    def is_available(self) -> bool:
+        with self._lock:
+            return not self.disabled and time.monotonic() >= self.cooldown_until
+
+    def wait_turn(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            wait_for = max(0.0, self.next_at - now)
+            reserved_at = max(now, self.next_at)
+            self.next_at = reserved_at + self.min_interval
+            self.attempts += 1
+        if wait_for > 0:
+            time.sleep(wait_for)
+
+    def record_success(self) -> None:
+        with self._lock:
+            self.successes += 1
+            self.failures = 0
+            self.last_error = ""
+
+    def record_failure(self, exc: BaseException) -> None:
+        with self._lock:
+            self.failures += 1
+            self.last_error = str(exc).splitlines()[0][:120]
+            if _is_unsupported_source_error(exc):
+                self.disabled = True
+                return
+            if _is_rate_limit_error(exc):
+                self.rate_limit_failures += 1
+                self.cooldown_until = max(
+                    self.cooldown_until,
+                    time.monotonic() + self.error_cooldown,
+                )
+            elif self.failures >= 3:
+                self.cooldown_until = max(
+                    self.cooldown_until,
+                    time.monotonic() + min(120.0, self.error_cooldown),
+                )
+                self.failures = 0
+
+    def health(self) -> dict[str, Any]:
+        with self._lock:
+            attempts = self.attempts
+            success_rate = 1.0 if attempts == 0 else self.successes / attempts
+            penalty = self.rate_limit_failures * 15
+            score = max(0, min(100, round(success_rate * 100 - penalty)))
+            cooling = max(0, round(self.cooldown_until - time.monotonic()))
+            return {
+                "source": self.source,
+                "effective_rpm": self.effective_rpm,
+                "attempts": attempts,
+                "successes": self.successes,
+                "score": score,
+                "cooling": cooling,
+                "disabled": self.disabled,
+            }
+
+
+class RoutedMarketDataProvider:
+    """Route OHLCV across vnstock sources, with Yahoo as a safe fallback."""
+
+    SUPPORTED_SOURCES = ("VCI", "KBS")
+
+    def __init__(
+        self,
+        fallback: YahooQuoteProvider,
+        usage_store: "ApiUsageStore",
+        api_key: str,
+        sources: Iterable[str] = ("VCI", "KBS"),
+        requests_per_minute: int = DEFAULT_VNSTOCK_REQUESTS_PER_MINUTE,
+        usage_ratio: float = DEFAULT_VNSTOCK_USAGE_RATIO,
+        error_cooldown: float = DEFAULT_VNSTOCK_ERROR_COOLDOWN,
+        cache_ttl: float = DEFAULT_VNSTOCK_CACHE_TTL,
+        history_fetcher: Callable[[str, str, str, str], list[PriceBar]] | None = None,
+    ):
+        self.fallback = fallback
+        self.usage_store = usage_store
+        self.api_key = api_key.strip()
+        normalized_sources = [
+            str(source).strip().upper()
+            for source in sources
+            if str(source).strip().upper() in self.SUPPORTED_SOURCES
+        ]
+        self.sources = list(dict.fromkeys(normalized_sources)) or list(self.SUPPORTED_SOURCES)
+        self.cache_ttl = max(0.0, float(cache_ttl))
+        self._history_cache: dict[tuple[str, str, str], tuple[float, list[PriceBar]]] = {}
+        self._unavailable_reason = ""
+        self._fetch_history = history_fetcher
+        if self._fetch_history is None and self.api_key:
+            try:
+                self._fetch_history = VnstockHistoryClient(self.api_key).fetch
+            except (Exception, SystemExit) as exc:
+                self._unavailable_reason = str(exc)
+                LOG.warning("VNStock disabled: %s", exc)
+        elif not self.api_key:
+            self._unavailable_reason = "chưa có VNSTOCK_API_KEY"
+        self._gates = {
+            source: VnstockSourceGate(
+                source,
+                requests_per_minute=requests_per_minute,
+                usage_ratio=usage_ratio,
+                error_cooldown=error_cooldown,
+            )
+            for source in self.sources
+        }
+
+    def get_quote(self, symbol: str) -> Quote:
+        # Yahoo is faster for the latest quote; VNStock is reserved for OHLCV.
+        return self.fallback.get_quote(symbol)
+
+    def get_fundamentals(self, symbol: str) -> FundamentalSnapshot:
+        return self.fallback.get_fundamentals(symbol)
+
+    def get_fundamentals_batch(
+        self,
+        symbols: Iterable[str],
+    ) -> dict[str, FundamentalSnapshot]:
+        return self.fallback.get_fundamentals_batch(symbols)
+
+    def _source_order(self, symbol: str) -> list[str]:
+        start = sum(ord(char) for char in symbol.upper()) % len(self.sources)
+        return self.sources[start:] + self.sources[:start]
+
+    def get_history(
+        self,
+        symbol: str,
+        range_value: str = "6mo",
+        interval: str = "1d",
+    ) -> list[PriceBar]:
+        normalized = symbol.upper()
+        cache_key = (normalized, range_value, interval)
+        cached = self._history_cache.get(cache_key)
+        now = time.monotonic()
+        if cached and now - cached[0] < self.cache_ttl:
+            return cached[1]
+
+        if self._fetch_history is not None:
+            for source in self._source_order(normalized):
+                gate = self._gates[source]
+                if not gate.is_available():
+                    continue
+                allowed, _, _ = self.usage_store.claim("vnstock_requests")
+                if not allowed:
+                    break
+                gate.wait_turn()
+                try:
+                    bars = self._fetch_history(source, normalized, range_value, interval)
+                    if len(bars) < 2:
+                        raise ValueError(f"{source} returned insufficient OHLCV")
+                except SystemExit as exc:
+                    gate.record_failure(exc)
+                    LOG.warning("[%s] VNStock stopped for %s: %s", source, normalized, exc)
+                    continue
+                except Exception as exc:
+                    gate.record_failure(exc)
+                    LOG.warning("[%s] VNStock failed for %s: %s", source, normalized, exc)
+                    continue
+                gate.record_success()
+                self._history_cache[cache_key] = (now, bars)
+                return bars
+
+        bars = self.fallback.get_history(normalized, range_value, interval)
+        self._history_cache[cache_key] = (now, bars)
+        return bars
+
+    def status_text(self) -> str:
+        lines = [
+            "<b>Luồng dữ liệu thị trường</b>",
+            "Giá nhanh: Yahoo",
+            f"Lịch sử/TA: {' ↔ '.join(self.sources)} → Yahoo dự phòng",
+            "Định giá: TradingView theo lô",
+        ]
+        if self._unavailable_reason:
+            lines.append(f"VNStock: tạm không dùng ({html.escape(self._unavailable_reason)})")
+        for source in self.sources:
+            state = self._gates[source].health()
+            if state["disabled"]:
+                status = "đã tắt"
+            elif state["cooling"]:
+                status = f"nghỉ {state['cooling']} giây"
+            else:
+                status = "sẵn sàng"
+            lines.append(
+                f"{source}: khỏe {state['score']}% — "
+                f"{state['successes']}/{state['attempts']} thành công, "
+                f"{state['effective_rpm']:.1f} lần/phút, {status}"
+            )
+        return "\n".join(lines)
+
+
 def format_number(value: float | None, decimals: int = 2) -> str:
     if value is None:
         return "—"
@@ -771,18 +1128,20 @@ class SignalStore:
 class ApiUsageStore:
     """Persist conservative daily counters used to protect upstream quotas."""
 
-    COUNTERS = ("gemini_requests", "deep_commands", "scan_commands")
+    COUNTERS = ("gemini_requests", "vnstock_requests", "deep_commands", "scan_commands")
 
     def __init__(
         self,
         path: Path,
         gemini_daily_budget: int = DEFAULT_GEMINI_DAILY_BUDGET,
+        vnstock_daily_budget: int = DEFAULT_VNSTOCK_DAILY_BUDGET,
         deep_daily_limit: int = DEFAULT_DEEP_DAILY_LIMIT,
         scan_daily_limit: int = DEFAULT_SCAN_DAILY_LIMIT,
     ):
         self.path = path
         self.limits = {
             "gemini_requests": max(1, int(gemini_daily_budget)),
+            "vnstock_requests": max(1, int(vnstock_daily_budget)),
             "deep_commands": max(1, int(deep_daily_limit)),
             "scan_commands": max(1, int(scan_daily_limit)),
         }
@@ -877,18 +1236,21 @@ class ApiUsageStore:
     def format_status(self, gemini_status: str) -> str:
         data = self.snapshot()
         gemini = data["gemini_requests"]
+        vnstock = data["vnstock_requests"]
         deep = data["deep_commands"]
         scan = data["scan_commands"]
         return (
             "<b>Ngân sách API an toàn hôm nay</b>\n"
             f"Gemini: {gemini['used']}/{gemini['limit']} "
             f"— {self._meter(gemini['used'], gemini['limit'])}\n"
+            f"VNStock: {vnstock['used']}/{vnstock['limit']} "
+            f"— {self._meter(vnstock['used'], vnstock['limit'])}\n"
             f"/deep: {deep['used']}/{deep['limit']} "
             f"— {self._meter(deep['used'], deep['limit'])}\n"
             f"/scan: {scan['used']}/{scan['limit']} "
             f"— {self._meter(scan['used'], scan['limit'])}\n"
             f"Trạng thái Gemini: {html.escape(gemini_status)}\n"
-            "Đặt lại lúc 00:00 (UTC+7). Đây là bộ đếm nội bộ, không phải quota trực tiếp từ Google."
+            "Đặt lại lúc 00:00 (UTC+7). Đây là bộ đếm nội bộ, không phải quota trực tiếp từ nhà cung cấp."
         )
 
 
@@ -1728,7 +2090,13 @@ class BotApplication:
                     if self.scanner is not None
                     else "chưa cấu hình"
                 )
-                return self.usage_store.format_status(gemini_status)
+                result = self.usage_store.format_status(gemini_status)
+                provider_status = getattr(self.provider, "status_text", None)
+                if callable(provider_status):
+                    status_text = provider_status()
+                    if isinstance(status_text, str) and status_text:
+                        result += "\n\n" + status_text
+                return result
             if command == "/quote":
                 argument = _argument(text)
                 if not argument:
@@ -1950,15 +2318,47 @@ def build_application() -> BotApplication:
         scan_daily_limit = int(
             os.environ.get("SCAN_DAILY_LIMIT", DEFAULT_SCAN_DAILY_LIMIT)
         )
+        vnstock_daily_budget = int(
+            os.environ.get("VNSTOCK_DAILY_BUDGET", DEFAULT_VNSTOCK_DAILY_BUDGET)
+        )
+        vnstock_requests_per_minute = int(
+            os.environ.get(
+                "VNSTOCK_REQUESTS_PER_MINUTE",
+                DEFAULT_VNSTOCK_REQUESTS_PER_MINUTE,
+            )
+        )
+        vnstock_usage_ratio = float(
+            os.environ.get("VNSTOCK_USAGE_RATIO", DEFAULT_VNSTOCK_USAGE_RATIO)
+        )
+        vnstock_error_cooldown = float(
+            os.environ.get("VNSTOCK_ERROR_COOLDOWN", DEFAULT_VNSTOCK_ERROR_COOLDOWN)
+        )
+        vnstock_cache_ttl = float(
+            os.environ.get("VNSTOCK_CACHE_TTL", DEFAULT_VNSTOCK_CACHE_TTL)
+        )
     except ValueError as exc:
         raise ValueError("Các biến timeout/score/limit phải là số.") from exc
     telegram = TelegramClient(token, timeout=max(10.0, poll_timeout + 10.0))
-    provider = YahooQuoteProvider(timeout=max(1.0, yahoo_timeout))
     usage_store = ApiUsageStore(
         data_dir / "api_usage.json",
         gemini_daily_budget=gemini_daily_budget,
+        vnstock_daily_budget=vnstock_daily_budget,
         deep_daily_limit=deep_daily_limit,
         scan_daily_limit=scan_daily_limit,
+    )
+    yahoo_provider = YahooQuoteProvider(timeout=max(1.0, yahoo_timeout))
+    provider = RoutedMarketDataProvider(
+        fallback=yahoo_provider,
+        usage_store=usage_store,
+        api_key=os.environ.get("VNSTOCK_API_KEY", ""),
+        sources=re.split(
+            r"[\s,;]+",
+            os.environ.get("VNSTOCK_SOURCES", DEFAULT_VNSTOCK_SOURCES),
+        ),
+        requests_per_minute=vnstock_requests_per_minute,
+        usage_ratio=vnstock_usage_ratio,
+        error_cooldown=vnstock_error_cooldown,
+        cache_ttl=vnstock_cache_ttl,
     )
     gemini = build_gemini_analyzer(usage_store)
     symbols = parse_symbols(os.environ.get("VN100_SYMBOLS"))

@@ -1,1 +1,4 @@
 google-genai>=2.3.0,<3
+# vnstock 4.0.4 supports the project's Python 3.12 cloud/Docker runtime.
+# Python 3.14 local runs keep working through the built-in Yahoo fallback.
+vnstock==4.0.4; python_version < "3.14"

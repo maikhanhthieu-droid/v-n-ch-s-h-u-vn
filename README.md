@@ -12,7 +12,7 @@ trên Python 3.10+ và dùng Google Gen AI SDK cho phần nghiên cứu có ki�
 - `/chart FPT`: biểu đồ chữ 30 phiên để xem nhanh trong Telegram
 - `/ta FPT`: MA5, MA20, RSI14, hỗ trợ/kháng cự gần
   - `/deep FPT`: phân tích P/E, P/B, chiết khấu 52 tuần; Gemini có thể kiểm tra tin mới bằng Google Search
-  - `/usage`: xem phần trăm ngân sách Gemini, `/deep` và `/scan` trong ngày
+  - `/usage`: xem phần trăm ngân sách Gemini, VNStock, `/deep`, `/scan` và sức khỏe từng nguồn
 - `/signals_on`, `/signals_off`, `/signals_status`: bật/tắt tín hiệu lọc sâu VN100
 - `/scan`: quét VN100 ngay, mặc định chỉ gửi mã đạt ngưỡng đủ sâu
 - `/market`: VN-Index
@@ -21,8 +21,10 @@ trên Python 3.10+ và dùng Google Gen AI SDK cho phần nghiên cứu có ki�
 - Lưu token bằng biến môi trường, không nhận token trên command line và không ghi token
   vào log/file.
 
-Nguồn giá là Yahoo Finance chart endpoint công khai. Dữ liệu có thể trễ, thiếu hoặc
-không khả dụng; bot không đưa ra khuyến nghị đầu tư.
+Bot phân vai nguồn dữ liệu: Yahoo cho giá nhanh, VNStock `VCI ↔ KBS` cho lịch sử/TA,
+TradingView cho định giá theo lô. Khi VNStock hết ngân sách hoặc một nguồn lỗi, bot
+tự chuyển nguồn rồi rơi về Yahoo. Dữ liệu có thể trễ, thiếu hoặc không khả dụng; bot
+không đưa ra khuyến nghị đầu tư.
 
 ## Chạy cục bộ
 
@@ -39,6 +41,7 @@ không khả dụng; bot không đưa ra khuyến nghị đầu tư.
    ```powershell
    $env:TELEGRAM_BOT_TOKEN = "<TOKEN_MỚI>"
    $env:GEMINI_API_KEY = "<KEY_GEMINI_THẬT>"
+   $env:VNSTOCK_API_KEY = "<KEY_VNSTOCK_THẬT>"
    ```
 
    Lưu ý: `os.environ.get("GEMINI_API_KEY")` chỉ là lệnh đọc biến môi trường,
@@ -59,6 +62,10 @@ không khả dụng; bot không đưa ra khuyến nghị đầu tư.
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\run_bot.ps1
    ```
+
+Python 3.12 được khuyến nghị và là phiên bản dùng trong Docker/GitHub Actions. Trên
+Python 3.14, bot vẫn chạy bằng Yahoo dự phòng nhưng thư viện VNStock 4.0.4 chưa được
+cài vì chuỗi phụ thuộc NumPy hiện chưa tương thích đầy đủ.
 
 Các biến tùy chọn: `POLL_TIMEOUT`, `YAHOO_TIMEOUT`, `DATA_DIR`, `LOG_LEVEL`.
 
@@ -99,11 +106,19 @@ Biến cấu hình:
 - `RESEARCH_COMMAND_COOLDOWN`: `/deep` và `/scan` cách nhau ít nhất `60` giây;
   `/ping`, `/quote` và các lệnh thường không bị ảnh hưởng
 - `GEMINI_DAILY_BUDGET`: ngân sách an toàn nội bộ, mặc định `12` API call/ngày
+- `VNSTOCK_API_KEY`: key VNStock; bot tự ánh xạ thêm sang `VNDATA_API_KEY`
+- `VNSTOCK_SOURCES`: thứ tự nguồn cho phép, mặc định `VCI,KBS`; thứ tự thực tế được
+  xoay theo mã để chia tải
+- `VNSTOCK_DAILY_BUDGET`: tối đa `60` lần gọi/ngày; hết mức này tự dùng Yahoo
+- `VNSTOCK_REQUESTS_PER_MINUTE`: trần khai báo cho từng nguồn, mặc định `12`
+- `VNSTOCK_USAGE_RATIO`: chỉ dùng `70%` trần trên, tức `8.4` lần/phút/nguồn
+- `VNSTOCK_ERROR_COOLDOWN`: nghỉ nguồn `300` giây khi gặp 429/quota
+- `VNSTOCK_CACHE_TTL`: cache lịch sử mỗi mã `480` giây
 - `DEEP_DAILY_LIMIT`: tối đa `10` lệnh `/deep` được nhận mỗi ngày
 - `SCAN_DAILY_LIMIT`: tối đa `2` lệnh `/scan` thủ công mỗi ngày
 - `SCAN_WEEKDAYS`: ngày quét, định dạng số thứ trong tuần của Python; mặc định `0,3` là thứ Hai và thứ Năm
 - `SCAN_TIME`: giờ quét theo giờ máy, mặc định `20:30`
-- `SCAN_WORKERS`: mặc định `4`, tối đa nội bộ `12`; worker này chỉ dùng lấy dữ liệu giá
+- `SCAN_WORKERS`: mặc định `2`, tối đa nội bộ `12`; giảm tải đồng thời lên nguồn giá
 - `MONTHLY_SIGNAL_LIMIT`: mặc định `2`
 - `MAX_SIGNALS_PER_SCAN`: mặc định `2`
 - `MIN_SIGNAL_SCORE`: mặc định `70`

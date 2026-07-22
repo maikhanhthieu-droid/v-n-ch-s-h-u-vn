@@ -18,9 +18,11 @@ from bot import (  # noqa: E402
     GeminiAnalyzer,
     PriceBar,
     Quote,
+    RoutedMarketDataProvider,
     SignalStore,
     WatchlistStore,
     YahooQuoteProvider,
+    _vnstock_bars,
     score_candidate,
     format_chart,
     format_quote,
@@ -311,6 +313,77 @@ class BotTests(unittest.TestCase):
         self.assertEqual(post.call_count, 1)
         self.assertAlmostEqual(snapshots["FPT"].trailing_pe, 11.8)
         self.assertAlmostEqual(snapshots["HPG"].price_to_book, 1.3)
+
+    def test_vnstock_bars_normalize_thousand_vnd_units(self):
+        bars = _vnstock_bars(
+            [
+                {"open": 99, "high": 102, "low": 98, "close": 100, "volume": 1000},
+                {"open": 100, "high": 103, "low": 99, "close": 101, "volume": 1200},
+            ],
+            "FPT",
+        )
+        self.assertEqual(bars[0].close, 100_000)
+        self.assertEqual(bars[1].high, 103_000)
+        self.assertEqual(bars[1].volume, 1200)
+
+    def test_vnstock_router_moves_to_next_source_after_quota_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            usage = ApiUsageStore(
+                Path(directory) / "usage.json",
+                vnstock_daily_budget=5,
+            )
+            fallback = Mock()
+            calls = []
+
+            def fetch(source, symbol, range_value, interval):
+                calls.append((source, symbol))
+                if source == "VCI":
+                    raise RuntimeError("429 quota exceeded")
+                return [PriceBar(close=100_000), PriceBar(close=101_000)]
+
+            provider = RoutedMarketDataProvider(
+                fallback=fallback,
+                usage_store=usage,
+                api_key="configured",
+                sources=["VCI", "KBS"],
+                history_fetcher=fetch,
+            )
+            bars = provider.get_history("FPT")
+            self.assertEqual(bars[-1].close, 101_000)
+            self.assertEqual(calls, [("VCI", "FPT"), ("KBS", "FPT")])
+            self.assertEqual(usage.snapshot()["vnstock_requests"]["used"], 2)
+            self.assertIn("VCI: khỏe", provider.status_text())
+            fallback.get_history.assert_not_called()
+
+    def test_vnstock_router_uses_yahoo_after_daily_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            usage = ApiUsageStore(
+                Path(directory) / "usage.json",
+                vnstock_daily_budget=1,
+            )
+            fallback = Mock()
+            fallback.get_history.return_value = [
+                PriceBar(close=99_000),
+                PriceBar(close=100_000),
+            ]
+            calls = []
+
+            def fetch(source, symbol, range_value, interval):
+                calls.append(source)
+                raise RuntimeError("temporary upstream error")
+
+            provider = RoutedMarketDataProvider(
+                fallback=fallback,
+                usage_store=usage,
+                api_key="configured",
+                sources=["VCI", "KBS"],
+                history_fetcher=fetch,
+            )
+            bars = provider.get_history("FPT")
+            self.assertEqual(bars[-1].close, 100_000)
+            self.assertEqual(len(calls), 1)
+            fallback.get_history.assert_called_once_with("FPT", "6mo", "1d")
+            self.assertEqual(usage.snapshot()["vnstock_requests"]["used"], 1)
 
     def test_watchlist_is_persisted(self):
         with tempfile.TemporaryDirectory() as directory:
