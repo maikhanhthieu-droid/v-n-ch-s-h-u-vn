@@ -974,7 +974,9 @@ class GeminiAnalyzer:
             remaining = self._quota_remaining()
             if remaining > 0:
                 raise GeminiQuotaCircuitOpen(f"Gemini quota cooldown: {remaining:.0f}s")
-            delay = self.min_interval - (time.monotonic() - self._last_request_at)
+            delay = 0.0
+            if self._last_request_at > 0:
+                delay = self.min_interval - (time.monotonic() - self._last_request_at)
             if delay > 0:
                 raise GeminiRequestCooldown(delay)
             if self.usage_store is not None:
@@ -1665,9 +1667,11 @@ class BotApplication:
     def _claim_research_slot(self) -> int:
         with self._research_lock:
             now = time.monotonic()
-            remaining = self.research_command_cooldown - (
-                now - self._research_last_started_at
-            )
+            remaining = 0.0
+            if self._research_last_started_at > 0:
+                remaining = self.research_command_cooldown - (
+                    now - self._research_last_started_at
+                )
             if remaining > 0:
                 return max(1, int(remaining) + 1)
             self._research_last_started_at = now
