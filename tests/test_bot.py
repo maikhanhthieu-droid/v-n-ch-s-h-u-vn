@@ -35,6 +35,7 @@ from bot import (  # noqa: E402
     score_candidate,
     split_telegram_html,
     format_chart,
+    format_deep_signal,
     format_quote,
     format_report,
     format_ta,
@@ -450,6 +451,25 @@ class BotTests(unittest.TestCase):
         self.assertIn("https://example.com/news", rendered)
         self.assertIn("không phải khuyến nghị", rendered)
 
+    def test_stock_news_filters_out_unrelated_headlines(self):
+        rss = """<?xml version="1.0" encoding="UTF-8"?>
+        <rss><channel>
+        <item><title>Cổ phiếu HAG được nhà đầu tư chú ý</title>
+        <link>https://example.com/hag</link><source>Nguồn A</source></item>
+        <item><title>Hoàng Anh Gia Lai công bố kế hoạch kinh doanh</title>
+        <link>https://example.com/hagl</link><source>Nguồn B</source></item>
+        <item><title>Thị trường quốc tế tăng điểm</title>
+        <link>https://example.com/world</link><source>Nguồn C</source></item>
+        </channel></rss>"""
+        service = NeutralNewsService(
+            fetcher=lambda url, timeout, accept: rss,
+        )
+        items = service.stock_headlines("HAG", "Hoang Anh Gia Lai JSC")
+        self.assertEqual([item.url for item in items], [
+            "https://example.com/hag",
+            "https://example.com/hagl",
+        ])
+
     def test_backtest_reports_samples_without_calling_it_future_probability(self):
         bars = [
             PriceBar(
@@ -464,9 +484,13 @@ class BotTests(unittest.TestCase):
         plan = build_trade_plan(quote, bars)
         result = backtest_similar_patterns(bars, plan)
         self.assertLessEqual(result.samples, 40)
+        self.assertEqual(result.lookahead_sessions, 20)
         if result.hit_rate is not None:
             self.assertGreaterEqual(result.hit_rate, 0)
             self.assertLessEqual(result.hit_rate, 100)
+        if result.positive_close_rate is not None:
+            self.assertGreaterEqual(result.positive_close_rate, 0)
+            self.assertLessEqual(result.positive_close_rate, 100)
         signal = build_deep_signal(
             "FPT",
             FundamentalSnapshot("FPT", "FPT"),
@@ -475,6 +499,11 @@ class BotTests(unittest.TestCase):
             MacroContext(),
         )
         self.assertEqual(signal.backtest.samples, result.samples)
+        self.assertEqual(signal.backtest_3m.lookahead_sessions, 60)
+        rendered = format_deep_signal(signal, "Phân tích trung lập.")
+        self.assertIn("1 tháng (~20 phiên)", rendered)
+        self.assertIn("3 tháng (~60 phiên)", rendered)
+        self.assertIn("lợi nhuận trung vị", rendered)
 
     def test_vnstock_bars_normalize_thousand_vnd_units(self):
         bars = _vnstock_bars(
@@ -658,7 +687,7 @@ class BotTests(unittest.TestCase):
             )
             scanner.gemini.status_text.return_value = "đã bật"
             news_service = Mock()
-            news_service.headlines.return_value = [
+            news_service.stock_headlines.return_value = [
                 NewsItem(
                     "FPT công bố thông tin mới",
                     "Nguồn thử nghiệm",
@@ -677,9 +706,14 @@ class BotTests(unittest.TestCase):
                 Path(directory) / "usage.json",
                 news_daily_limit=1,
             )
+            provider = Mock()
+            provider.get_fundamentals.return_value = FundamentalSnapshot(
+                "FPT",
+                "FPT Corp",
+            )
             app = BotApplication(
                 telegram=Mock(),
-                provider=Mock(),
+                provider=provider,
                 store=WatchlistStore(Path(directory) / "watchlists.json"),
                 scanner=scanner,
                 usage_store=usage,
@@ -690,6 +724,7 @@ class BotTests(unittest.TestCase):
             first = app.handle_text("/news FPT", 1)
             self.assertIn("https://example.com/fpt", first)
             self.assertIn("Đánh giá hai chiều", first)
+            news_service.stock_headlines.assert_called_once_with("FPT", "FPT Corp")
             self.assertIn("100%", app.handle_text("/new VNM", 1))
             self.assertIn("/news: 1/1", app.handle_text("/usage", 1))
 

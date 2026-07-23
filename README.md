@@ -15,6 +15,8 @@ trên Python 3.10+ và dùng Google Gen AI SDK cho phần nghiên cứu có ki�
   theo kịch bản và backtest trạng thái tương tự
 - `/news FPT` hoặc `/news Thông tư 14/2026`: phân tích tiêu đề theo hai chiều,
   luôn gắn nguồn và nêu phần chưa thể xác nhận
+- `/new FPT`: bí danh ngắn của `/news FPT`; khi đầu vào là một mã, bot lấy thêm
+  tên doanh nghiệp và loại mọi tiêu đề không chứa mã/tên tương ứng
 - `/macro`: trạng thái/tin vĩ mô trung lập từ
   [`vimo-VN`](https://github.com/maikhanhthieu-droid/vimo-VN)
 - `/usage`: xem phần trăm ngân sách Gemini, VNStock, `/deep`, `/scan`, `/news`
@@ -90,10 +92,12 @@ có giới hạn. Khung điểm 100 cố định, Gemini chỉ giải thích và
 - Vĩ mô: `10` điểm — ánh xạ bảo thủ từ trạng thái trung lập của `vimo-VN`;
   không tải được nguồn thì giữ `5/10`
 
-`/deep` dùng tối đa hai năm dữ liệu để tìm các trạng thái xu hướng/RSI tương tự.
-Hit-rate là tỷ lệ lịch sử chạm T1 trước stop trong 20 phiên, chỉ hiện khi có ít
-nhất 5 mẫu đã ngã ngũ. Nếu cùng một nến ngày chạm cả hai mốc, bot tính là stop.
-Con số này không phải xác suất tương lai.
+`/deep` dùng tối đa hai năm dữ liệu để tìm các trạng thái xu hướng/RSI tương tự
+ở hai khung: 1 tháng (20 phiên) và 3 tháng (60 phiên). Mỗi khung hiển thị hai
+định nghĩa riêng: tỷ lệ chạm T1 trước stop, và tỷ lệ giá cuối kỳ cao hơn giá vào
+kèm lợi nhuận trung vị. Hit-rate T1 chỉ hiện khi có ít nhất 5 mẫu đã ngã ngũ;
+tỷ lệ cuối kỳ chỉ hiện khi có ít nhất 5 mẫu hoàn tất. Nếu cùng một nến ngày chạm
+cả target và stop, bot tính là stop. Các con số không phải xác suất tương lai.
 
 Lệnh Telegram:
 

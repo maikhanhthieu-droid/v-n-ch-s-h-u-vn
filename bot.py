@@ -44,6 +44,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -260,6 +261,9 @@ class BacktestResult:
     losses: int
     unresolved: int
     hit_rate: float | None
+    positive_closes: int = 0
+    positive_close_rate: float | None = None
+    median_return: float | None = None
     lookahead_sessions: int = 20
     target_label: str = "T1"
 
@@ -288,6 +292,7 @@ class DeepSignal:
     macro: MacroContext | None = None
     trade_plan: TradePlan | None = None
     backtest: BacktestResult | None = None
+    backtest_3m: BacktestResult | None = None
 
 
 def normalize_symbol(raw: str) -> str:
@@ -419,6 +424,22 @@ def _string_items(value: Any, limit: int = 6) -> tuple[str, ...]:
         if len(items) >= limit:
             break
     return tuple(items)
+
+
+def _fold_search_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value or ""))
+    without_marks = "".join(char for char in normalized if not unicodedata.combining(char))
+    return re.sub(r"[^a-z0-9]+", " ", without_marks.casefold()).strip()
+
+
+def _company_search_name(value: str) -> str:
+    cleaned = re.sub(
+        r"\b(jsc|corp(?:oration)?|company|joint stock|holdings?|group|plc|ltd)\b\.?",
+        " ",
+        str(value or ""),
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r"\s+", " ", cleaned).strip(" -,.")
 
 
 class MacroContextClient:
@@ -620,11 +641,35 @@ class NeutralNewsService:
                 break
         return results
 
-    def headlines(self, topic: str) -> list[NewsItem]:
+    @staticmethod
+    def _matches_terms(title: str, terms: Iterable[str]) -> bool:
+        folded_title = _fold_search_text(title)
+        padded_title = f" {folded_title} "
+        for term in terms:
+            folded_term = _fold_search_text(term)
+            if not folded_term:
+                continue
+            if " " in folded_term:
+                if folded_term in folded_title:
+                    return True
+            elif f" {folded_term} " in padded_title:
+                return True
+        return False
+
+    def headlines(
+        self,
+        topic: str,
+        required_terms: Iterable[str] | None = None,
+    ) -> list[NewsItem]:
         clean_topic = re.sub(r"\s+", " ", topic).strip()[:120]
         if not clean_topic:
             return []
-        cache_key = clean_topic.casefold()
+        terms = tuple(
+            str(term).strip()
+            for term in (required_terms or ())
+            if str(term).strip()
+        )
+        cache_key = f"{clean_topic.casefold()}|{'|'.join(term.casefold() for term in terms)}"
         now = time.monotonic()
         with self._lock:
             cached = self._cache.get(cache_key)
@@ -637,9 +682,21 @@ class NeutralNewsService:
         )
         raw = self.fetcher(url, self.timeout, "application/rss+xml, application/xml")
         results = self._parse_rss(raw, self.max_items)
+        if terms:
+            results = [item for item in results if self._matches_terms(item.title, terms)]
         with self._lock:
             self._cache[cache_key] = (now + self.cache_ttl, list(results))
         return results
+
+    def stock_headlines(self, symbol: str, company_name: str) -> list[NewsItem]:
+        clean_symbol = normalize_symbol(symbol)
+        clean_company = _company_search_name(company_name)
+        aliases = [clean_symbol]
+        if clean_company:
+            aliases.append(clean_company)
+        quoted = " OR ".join(f'"{alias}"' for alias in aliases)
+        query = f"({quoted}) (cổ phiếu OR doanh nghiệp)"
+        return self.headlines(query, required_terms=aliases)
 
 
 class YahooQuoteProvider:
@@ -1806,6 +1863,7 @@ class GeminiAnalyzer:
         breakdown = signal.breakdown
         plan = signal.trade_plan
         backtest = signal.backtest
+        backtest_3m = signal.backtest_3m
         macro = signal.macro or MacroContext()
         web_instruction = (
             "Hãy dùng Google Search để kiểm tra thông tin mới nhất từ nguồn sơ cấp/đáng tin "
@@ -1843,7 +1901,8 @@ class GeminiAnalyzer:
             f"Điểm tổng: {signal.score}/100\n"
             f"Điểm thành phần: {breakdown}\n"
             f"Kịch bản target/stop: {plan}\n"
-            f"Backtest trạng thái tương tự: {backtest}\n"
+            f"Backtest 1 tháng (~20 phiên): {backtest}\n"
+            f"Backtest 3 tháng (~60 phiên): {backtest_3m}\n"
             f"Vĩ mô vimo-VN: stance={macro.stance}; score={macro.score}; "
             f"summary={macro.summary}; tích cực={macro.positive_drivers}; "
             f"rủi ro={macro.risk_drivers}; chính sách={macro.policy_notes}; "
@@ -2556,12 +2615,26 @@ def backtest_similar_patterns(
 
     closes = [bar.close for bar in bars]
     if len(closes) < 80 or plan.risk_pct <= 0:
-        return BacktestResult(0, 0, 0, 0, None, lookahead_sessions)
+        return BacktestResult(
+            samples=0,
+            wins=0,
+            losses=0,
+            unresolved=0,
+            hit_rate=None,
+            lookahead_sessions=lookahead_sessions,
+        )
     current_signature = _market_signature(closes, len(closes) - 1)
     if current_signature is None:
-        return BacktestResult(0, 0, 0, 0, None, lookahead_sessions)
+        return BacktestResult(
+            samples=0,
+            wins=0,
+            losses=0,
+            unresolved=0,
+            hit_rate=None,
+            lookahead_sessions=lookahead_sessions,
+        )
     candidate_indices: list[int] = []
-    last_possible = len(closes) - lookahead_sessions - 2
+    last_possible = len(closes) - lookahead_sessions - 1
     for index in range(50, max(50, last_possible + 1)):
         if _market_signature(closes, index) == current_signature:
             candidate_indices.append(index)
@@ -2570,8 +2643,11 @@ def backtest_similar_patterns(
     wins = 0
     losses = 0
     unresolved = 0
+    holding_returns: list[float] = []
     for index in candidate_indices:
         entry = closes[index]
+        exit_price = closes[index + lookahead_sessions]
+        holding_returns.append((exit_price / entry - 1.0) * 100.0)
         target = entry * (1.0 + risk_ratio)
         stop = entry * (1.0 - risk_ratio)
         outcome = ""
@@ -2595,12 +2671,31 @@ def backtest_similar_patterns(
             unresolved += 1
     resolved = wins + losses
     hit_rate = wins / resolved * 100 if resolved >= 5 else None
+    positive_closes = sum(1 for item in holding_returns if item > 0)
+    positive_close_rate = (
+        positive_closes / len(holding_returns) * 100
+        if len(holding_returns) >= 5
+        else None
+    )
+    median_return = None
+    if holding_returns:
+        ordered_returns = sorted(holding_returns)
+        middle = len(ordered_returns) // 2
+        if len(ordered_returns) % 2:
+            median_return = ordered_returns[middle]
+        else:
+            median_return = (
+                ordered_returns[middle - 1] + ordered_returns[middle]
+            ) / 2.0
     return BacktestResult(
         samples=len(candidate_indices),
         wins=wins,
         losses=losses,
         unresolved=unresolved,
         hit_rate=hit_rate,
+        positive_closes=positive_closes,
+        positive_close_rate=positive_close_rate,
+        median_return=median_return,
         lookahead_sessions=lookahead_sessions,
     )
 
@@ -2614,7 +2709,8 @@ def build_deep_signal(
 ) -> DeepSignal:
     breakdown, reasons = build_score_breakdown(snapshot, quote, bars, macro)
     plan = build_trade_plan(quote, bars)
-    backtest = backtest_similar_patterns(bars, plan)
+    backtest = backtest_similar_patterns(bars, plan, 20)
+    backtest_3m = backtest_similar_patterns(bars, plan, 60)
     return DeepSignal(
         symbol=symbol,
         score=breakdown.total,
@@ -2626,6 +2722,7 @@ def build_deep_signal(
         macro=macro,
         trade_plan=plan,
         backtest=backtest,
+        backtest_3m=backtest_3m,
     )
 
 
@@ -2657,6 +2754,37 @@ def _compose_telegram_html(
     return rendered if len(rendered) <= limit else prefix[: max(0, limit - len(suffix))] + suffix
 
 
+def _format_backtest_horizon(label: str, result: BacktestResult) -> str:
+    if result.samples == 0:
+        return f"{label}: chưa có đủ lịch sử phù hợp."
+    resolved = result.wins + result.losses
+    if result.hit_rate is None:
+        target_text = (
+            f"T1 trước stop: chưa đủ mẫu kết luận "
+            f"({result.wins} đạt/{result.losses} dừng/{result.unresolved} chưa ngã ngũ)"
+        )
+    else:
+        target_text = (
+            f"T1 trước stop {result.hit_rate:.1f}% "
+            f"({result.wins}/{resolved} mẫu đã ngã ngũ; "
+            f"{result.unresolved} chưa ngã ngũ)"
+        )
+    if result.positive_close_rate is None:
+        holding_text = "giá cuối kỳ dương: chưa đủ mẫu"
+    else:
+        median_text = (
+            f"{result.median_return:+.1f}%"
+            if result.median_return is not None
+            else "—"
+        )
+        holding_text = (
+            f"giá cuối kỳ dương {result.positive_close_rate:.1f}% "
+            f"({result.positive_closes}/{result.samples}); "
+            f"lợi nhuận trung vị {median_text}"
+        )
+    return f"{label}: {target_text}; {holding_text}."
+
+
 def format_deep_signal(signal: DeepSignal, gemini_text: str) -> str:
     snapshot = signal.snapshot
     price = snapshot.price or signal.quote.price
@@ -2670,23 +2798,19 @@ def format_deep_signal(signal: DeepSignal, gemini_text: str) -> str:
         )
     plan = signal.trade_plan or build_trade_plan(signal.quote, signal.bars)
     backtest = signal.backtest or backtest_similar_patterns(signal.bars, plan)
+    backtest_3m = signal.backtest_3m or backtest_similar_patterns(
+        signal.bars,
+        plan,
+        60,
+    )
     macro = signal.macro or MacroContext()
     macro_score = (
         format_number(macro.score, 1)
         if macro.available and macro.score is not None
         else "—"
     )
-    if backtest.hit_rate is None:
-        backtest_line = (
-            f"Chưa đủ mẫu kết luận ({backtest.samples} mẫu; "
-            f"{backtest.wins} đạt/{backtest.losses} dừng/{backtest.unresolved} chưa ngã ngũ)."
-        )
-    else:
-        backtest_line = (
-            f"{backtest.hit_rate:.1f}% chạm {backtest.target_label} trước stop "
-            f"({backtest.wins}/{backtest.wins + backtest.losses} mẫu đã ngã ngũ; "
-            f"{backtest.unresolved} chưa ngã ngũ)."
-        )
+    backtest_1m_line = _format_backtest_horizon("1 tháng (~20 phiên)", backtest)
+    backtest_3m_line = _format_backtest_horizon("3 tháng (~60 phiên)", backtest_3m)
     source_line = ""
     if macro.sources:
         source = macro.sources[0]
@@ -2722,8 +2846,9 @@ def format_deep_signal(signal: DeepSignal, gemini_text: str) -> str:
         f"T1/T2/T3: {format_number(plan.target_1)} / "
         f"{format_number(plan.target_2)} / {format_number(plan.target_3)}\n\n"
         "<b>3) Thống kê mẫu hình lịch sử</b>\n"
-        f"{html.escape(backtest_line)} Khung {backtest.lookahead_sessions} phiên; "
-        "cùng nến chạm cả target và stop được tính là stop.\n\n"
+        f"{html.escape(backtest_1m_line)}\n"
+        f"{html.escape(backtest_3m_line)}\n"
+        "T1/stop dùng cùng tỷ lệ rủi ro hiện tại; cùng nến chạm cả hai được tính là stop.\n\n"
         "<b>4) Bối cảnh vĩ mô trung lập</b>\n"
         f"{html.escape(macro.stance)} (điểm vimo-VN {macro_score}) — "
         f"{html.escape(_plain_excerpt(driver_line, 420))}"
@@ -3007,6 +3132,7 @@ HELP = (
     "/ta <code>FPT</code> — MA5, MA20, RSI14, hỗ trợ/kháng cự\n"
     "/deep <code>FPT</code> — doanh nghiệp, định giá, mẫu hình, điểm 100, target/stop và backtest\n"
     "/news <code>FPT</code> — phân tích tin doanh nghiệp/chủ đề theo hai chiều, có nguồn\n"
+    "/new <code>FPT</code> — bí danh ngắn của /news, chỉ giữ tin đúng mã/doanh nghiệp\n"
     "/macro — tin và trạng thái vĩ mô trung lập từ vimo-VN\n"
     "/signals_on — nhận tín hiệu lọc sâu VN100\n"
     "/signals_off — tắt tín hiệu lọc sâu\n"
@@ -3287,8 +3413,33 @@ class BotApplication:
                     if self.macro_client is not None
                     else MacroContext()
                 )
+                analysis_topic = topic
                 try:
-                    items = self.news_service.headlines(topic)
+                    stock_symbol = (
+                        normalize_symbol(topic)
+                        if SYMBOL_RE.fullmatch(topic.strip().upper())
+                        else None
+                    )
+                    if stock_symbol:
+                        company_name = stock_symbol
+                        try:
+                            company_name = self.provider.get_fundamentals(
+                                stock_symbol
+                            ).name
+                        except BotError:
+                            try:
+                                company_name = self.provider.get_quote(
+                                    stock_symbol
+                                ).name
+                            except BotError:
+                                pass
+                        analysis_topic = f"{stock_symbol} — {company_name}"
+                        items = self.news_service.stock_headlines(
+                            stock_symbol,
+                            company_name,
+                        )
+                    else:
+                        items = self.news_service.headlines(topic)
                 except BotError as exc:
                     LOG.warning("News RSS unavailable: %s", exc)
                     items = []
@@ -3297,8 +3448,8 @@ class BotApplication:
                     if self.scanner is not None
                     else build_gemini_analyzer(self.usage_store)
                 )
-                analysis = gemini.analyze_news(topic, items, macro)
-                return format_news_report(topic, items, macro, analysis)
+                analysis = gemini.analyze_news(analysis_topic, items, macro)
+                return format_news_report(analysis_topic, items, macro, analysis)
             if command == "/signals_on":
                 if not self.signal_store:
                     return "Tính năng tín hiệu chưa được cấu hình."
