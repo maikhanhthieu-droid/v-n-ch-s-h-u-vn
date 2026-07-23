@@ -16,6 +16,10 @@ from bot import (  # noqa: E402
     DeepSignal,
     FundamentalSnapshot,
     GeminiAnalyzer,
+    MacroContext,
+    MacroContextClient,
+    NewsItem,
+    NeutralNewsService,
     PriceBar,
     Quote,
     RoutedMarketDataProvider,
@@ -23,7 +27,13 @@ from bot import (  # noqa: E402
     WatchlistStore,
     YahooQuoteProvider,
     _vnstock_bars,
+    backtest_similar_patterns,
+    build_deep_signal,
+    build_score_breakdown,
+    build_trade_plan,
+    format_news_report,
     score_candidate,
+    split_telegram_html,
     format_chart,
     format_quote,
     format_report,
@@ -93,20 +103,71 @@ class BotTests(unittest.TestCase):
         self.assertIn("TA nhanh", rendered_ta)
         self.assertIn("RSI14", rendered_ta)
 
-    def test_deep_signal_score_rewards_discount_and_low_valuation(self):
-        quote = Quote("FPT", "FPT Company", 70.0, 72.0)
+    def test_long_telegram_output_splits_at_paragraph_boundaries(self):
+        first = "<b>Một</b>\n" + "a" * 2500
+        second = "<b>Hai</b>\n" + "b" * 2500
+        chunks = split_telegram_html(first + "\n\n" + second)
+        self.assertEqual(chunks, [first, second])
+        self.assertTrue(all(len(chunk) <= 4090 for chunk in chunks))
+
+    def test_deep_signal_score_rewards_quality_valuation_and_trend(self):
+        bars = [
+            PriceBar(
+                close=50_000 + index * 120 + ((index % 6) - 3) * 80,
+                high=50_500 + index * 120 + ((index % 6) - 3) * 80,
+                low=49_500 + index * 120 + ((index % 6) - 3) * 80,
+                volume=1_000_000 + index * 1_000,
+            )
+            for index in range(250)
+        ]
+        quote = Quote("FPT", "FPT Company", bars[-1].close, bars[-2].close)
         snapshot = FundamentalSnapshot(
             symbol="FPT",
             name="FPT Company",
-            price=70.0,
+            price=bars[-1].close,
             trailing_pe=9.0,
             price_to_book=1.1,
-            fifty_two_week_high=110.0,
+            revenue_growth=18.0,
+            net_income_growth=24.0,
+            return_on_equity=23.0,
+            debt_to_equity=0.35,
+            current_ratio=1.8,
+            earnings_growth=24.0,
         )
-        bars = [PriceBar(close=90.0 - index, high=91.0 - index, low=89.0 - index) for index in range(30)]
         score, reasons = score_candidate(snapshot, quote, bars)
         self.assertGreaterEqual(score, 70)
         self.assertTrue(reasons)
+
+    def test_score_breakdown_is_auditable_and_totals_100_scale(self):
+        bars = [
+            PriceBar(close=100 + index / 2, volume=1_000_000)
+            for index in range(220)
+        ]
+        quote = Quote("FPT", "FPT", bars[-1].close, bars[-2].close)
+        snapshot = FundamentalSnapshot(
+            "FPT",
+            "FPT",
+            price=quote.price,
+            trailing_pe=10,
+            price_to_book=1.4,
+            revenue_growth=12,
+            net_income_growth=15,
+            return_on_equity=18,
+            debt_to_equity=0.4,
+            current_ratio=1.5,
+        )
+        macro = MacroContext(score=2, available=True)
+        breakdown, _ = build_score_breakdown(snapshot, quote, bars, macro)
+        self.assertEqual(
+            breakdown.total,
+            breakdown.business
+            + breakdown.valuation
+            + breakdown.technical
+            + breakdown.risk
+            + breakdown.macro,
+        )
+        self.assertLessEqual(breakdown.total, 100)
+        self.assertEqual(breakdown.macro, 6)
 
     def test_deep_signal_score_rejects_negative_multiples(self):
         quote = Quote("BAD", "Bad Company", 70.0, 72.0)
@@ -303,8 +364,22 @@ class BotTests(unittest.TestCase):
     def test_fundamentals_batch_uses_one_tradingview_request(self):
         response = {
             "data": [
-                {"s": "HOSE:FPT", "d": ["FPT", "FPT Corp", 67000, 11.8, 2.9, 1000]},
-                {"s": "HOSE:HPG", "d": ["HPG", "Hoa Phat", 21850, 8.4, 1.3, 900]},
+                {
+                    "s": "HOSE:FPT",
+                    "d": [
+                        "FPT", "FPT Corp", 67000, 11.8, 2.9, 1000,
+                        "Technology Services", "IT Services", 5000, 18.2,
+                        900, 21.5, 24.0, 0.35, 1.7, 5400, 20.2,
+                    ],
+                },
+                {
+                    "s": "HOSE:HPG",
+                    "d": [
+                        "HPG", "Hoa Phat", 21850, 8.4, 1.3, 900,
+                        "Non-Energy Minerals", "Steel", 6000, 9.0,
+                        700, 12.0, 16.0, 0.55, 1.2, 2600, 11.0,
+                    ],
+                },
             ]
         }
         provider = YahooQuoteProvider()
@@ -313,6 +388,85 @@ class BotTests(unittest.TestCase):
         self.assertEqual(post.call_count, 1)
         self.assertAlmostEqual(snapshots["FPT"].trailing_pe, 11.8)
         self.assertAlmostEqual(snapshots["HPG"].price_to_book, 1.3)
+        self.assertEqual(snapshots["FPT"].sector, "Technology Services")
+        self.assertAlmostEqual(snapshots["FPT"].return_on_equity, 24.0)
+
+    def test_macro_context_parses_vimo_sources_and_drivers(self):
+        payload = {
+            "generated_at_bkk": "2026-07-23 08:00",
+            "macro_strategy": {
+                "stance": "NẮM GIỮ / CHỜ XÁC NHẬN",
+                "score": -2,
+                "reason_short": "Tăng trưởng và lạm phát đang kéo theo hai hướng.",
+                "positive_drivers": ["IIP tăng"],
+                "risk_drivers": ["CPI cao"],
+                "confidence": "LOW",
+            },
+            "cards": [
+                {
+                    "key": "cpi",
+                    "source_primary": "NSO/GSO",
+                    "source_url": "https://example.com/cpi",
+                    "as_of": "2026-07",
+                    "source_quality": "official",
+                }
+            ],
+        }
+        client = MacroContextClient(fetcher=lambda url, timeout: payload)
+        context = client.latest()
+        self.assertTrue(context.available)
+        self.assertEqual(context.score, -2)
+        self.assertEqual(context.risk_drivers, ("CPI cao",))
+        self.assertEqual(context.sources[0].url, "https://example.com/cpi")
+
+    def test_rss_parser_and_news_formatter_keep_sources(self):
+        rss = """<?xml version="1.0" encoding="UTF-8"?>
+        <rss><channel><item>
+        <title>Doanh nghiệp công bố kế hoạch mới</title>
+        <link>https://example.com/news</link>
+        <source>Ví dụ</source><pubDate>Thu, 23 Jul 2026 08:00:00 GMT</pubDate>
+        </item></channel></rss>"""
+        items = NeutralNewsService._parse_rss(rss, 5)
+        self.assertEqual(items[0].source, "Ví dụ")
+        rendered = format_news_report(
+            "FPT",
+            items,
+            MacroContext(
+                stance="TRUNG LẬP",
+                score=0,
+                summary="Chờ xác nhận.",
+                available=True,
+            ),
+            "Tác động có cả cơ hội và rủi ro; cần mở công bố gốc.",
+        )
+        self.assertIn("https://example.com/news", rendered)
+        self.assertIn("không phải khuyến nghị", rendered)
+
+    def test_backtest_reports_samples_without_calling_it_future_probability(self):
+        bars = [
+            PriceBar(
+                close=100 + index * 0.03 + (index % 20) * 0.4,
+                high=100.8 + index * 0.03 + (index % 20) * 0.4,
+                low=99.2 + index * 0.03 + (index % 20) * 0.4,
+                volume=500_000,
+            )
+            for index in range(360)
+        ]
+        quote = Quote("FPT", "FPT", bars[-1].close, bars[-2].close)
+        plan = build_trade_plan(quote, bars)
+        result = backtest_similar_patterns(bars, plan)
+        self.assertLessEqual(result.samples, 40)
+        if result.hit_rate is not None:
+            self.assertGreaterEqual(result.hit_rate, 0)
+            self.assertLessEqual(result.hit_rate, 100)
+        signal = build_deep_signal(
+            "FPT",
+            FundamentalSnapshot("FPT", "FPT"),
+            quote,
+            bars,
+            MacroContext(),
+        )
+        self.assertEqual(signal.backtest.samples, result.samples)
 
     def test_vnstock_bars_normalize_thousand_vnd_units(self):
         bars = _vnstock_bars(
@@ -487,6 +641,49 @@ class BotTests(unittest.TestCase):
             usage_text = app.handle_text("/usage", 1)
             self.assertIn("/deep: 1/1", usage_text)
             self.assertIn("/scan: 1/1", usage_text)
+
+    def test_news_command_uses_sources_macro_and_daily_counter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scanner = Mock()
+            scanner.gemini.analyze_news.return_value = (
+                "Dữ kiện còn hạn chế; cần kiểm tra công bố gốc."
+            )
+            scanner.gemini.status_text.return_value = "đã bật"
+            news_service = Mock()
+            news_service.headlines.return_value = [
+                NewsItem(
+                    "FPT công bố thông tin mới",
+                    "Nguồn thử nghiệm",
+                    "https://example.com/fpt",
+                    "2026-07-23",
+                )
+            ]
+            macro_client = Mock()
+            macro_client.latest.return_value = MacroContext(
+                stance="TRUNG LẬP",
+                score=0,
+                summary="Chờ xác nhận.",
+                available=True,
+            )
+            usage = ApiUsageStore(
+                Path(directory) / "usage.json",
+                news_daily_limit=1,
+            )
+            app = BotApplication(
+                telegram=Mock(),
+                provider=Mock(),
+                store=WatchlistStore(Path(directory) / "watchlists.json"),
+                scanner=scanner,
+                usage_store=usage,
+                macro_client=macro_client,
+                news_service=news_service,
+                research_command_cooldown=0,
+            )
+            first = app.handle_text("/news FPT", 1)
+            self.assertIn("https://example.com/fpt", first)
+            self.assertIn("Đánh giá hai chiều", first)
+            self.assertIn("100%", app.handle_text("/news VNM", 1))
+            self.assertIn("/news: 1/1", app.handle_text("/usage", 1))
 
     def test_provider_errors_are_user_safe(self):
         with tempfile.TemporaryDirectory() as directory:

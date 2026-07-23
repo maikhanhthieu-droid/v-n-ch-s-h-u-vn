@@ -11,8 +11,14 @@ trên Python 3.10+ và dùng Google Gen AI SDK cho phần nghiên cứu có ki�
 - `/report FPT`: báo cáo nhanh gồm giá, mở cửa, cao/thấp phiên và khối lượng
 - `/chart FPT`: biểu đồ chữ 30 phiên để xem nhanh trong Telegram
 - `/ta FPT`: MA5, MA20, RSI14, hỗ trợ/kháng cự gần
-  - `/deep FPT`: phân tích P/E, P/B, chiết khấu 52 tuần; Gemini có thể kiểm tra tin mới bằng Google Search
-  - `/usage`: xem phần trăm ngân sách Gemini, VNStock, `/deep`, `/scan` và sức khỏe từng nguồn
+- `/deep FPT`: cấu trúc doanh nghiệp, định giá, mẫu hình, điểm 100, target/stop
+  theo kịch bản và backtest trạng thái tương tự
+- `/news FPT` hoặc `/news Thông tư 14/2026`: phân tích tiêu đề theo hai chiều,
+  luôn gắn nguồn và nêu phần chưa thể xác nhận
+- `/macro`: trạng thái/tin vĩ mô trung lập từ
+  [`vimo-VN`](https://github.com/maikhanhthieu-droid/vimo-VN)
+- `/usage`: xem phần trăm ngân sách Gemini, VNStock, `/deep`, `/scan`, `/news`
+  và sức khỏe từng nguồn
 - `/signals_on`, `/signals_off`, `/signals_status`: bật/tắt tín hiệu lọc sâu VN100
 - `/scan`: quét VN100 ngay, mặc định chỉ gửi mã đạt ngưỡng đủ sâu
 - `/market`: VN-Index
@@ -22,9 +28,10 @@ trên Python 3.10+ và dùng Google Gen AI SDK cho phần nghiên cứu có ki�
   vào log/file.
 
 Bot phân vai nguồn dữ liệu: Yahoo cho giá nhanh, VNStock `VCI ↔ KBS` cho lịch sử/TA,
-TradingView cho định giá theo lô. Khi VNStock hết ngân sách hoặc một nguồn lỗi, bot
-tự chuyển nguồn rồi rơi về Yahoo. Dữ liệu có thể trễ, thiếu hoặc không khả dụng; bot
-không đưa ra khuyến nghị đầu tư.
+TradingView cho số liệu doanh nghiệp/định giá theo lô, `vimo-VN` cho trạng thái vĩ
+mô, Google News RSS cho metadata tiêu đề. Khi VNStock hết ngân sách hoặc một nguồn
+lỗi, bot tự chuyển nguồn rồi rơi về Yahoo. Dữ liệu có thể trễ, thiếu hoặc không khả
+dụng; bot không đưa ra khuyến nghị đầu tư.
 
 ## Chạy cục bộ
 
@@ -72,14 +79,21 @@ Các biến tùy chọn: `POLL_TIMEOUT`, `YAHOO_TIMEOUT`, `DATA_DIR`, `LOG_LEVEL
 ## Tín hiệu lọc sâu VN100
 
 Bot có thể tự quét rổ VN100 mặc định 2 lần/tuần và chỉ gửi tối đa vài tín hiệu
-định giá sâu mỗi tháng. TradingView được gọi theo lô, còn dữ liệu lịch sử được
-lấy song song có giới hạn để lần quét hoàn thành nhanh hơn. Bộ lọc ưu tiên cổ
-phiếu có:
+mỗi tháng. TradingView được gọi theo lô, còn dữ liệu lịch sử được lấy song song
+có giới hạn. Khung điểm 100 cố định, Gemini chỉ giải thích và không được sửa:
 
-- Chiết khấu mạnh so với đỉnh 52 tuần
-- P/E và P/B ở vùng thấp/hợp lý
-- RSI đã hạ nhiệt
-- Điểm tổng hợp đạt `MIN_SIGNAL_SCORE`
+- Chất lượng doanh nghiệp: `30` điểm — tăng trưởng doanh thu/lợi nhuận, ROE,
+  đòn bẩy và thanh toán hiện hành
+- Định giá: `25` điểm — P/E, P/B và tương quan định giá/tăng trưởng
+- Kỹ thuật/mẫu hình: `25` điểm — MA20/50/200, RSI, mẫu hình và khối lượng
+- Rủi ro: `10` điểm — biến động năm hóa và giá trị giao dịch bình quân
+- Vĩ mô: `10` điểm — ánh xạ bảo thủ từ trạng thái trung lập của `vimo-VN`;
+  không tải được nguồn thì giữ `5/10`
+
+`/deep` dùng tối đa hai năm dữ liệu để tìm các trạng thái xu hướng/RSI tương tự.
+Hit-rate là tỷ lệ lịch sử chạm T1 trước stop trong 20 phiên, chỉ hiện khi có ít
+nhất 5 mẫu đã ngã ngũ. Nếu cùng một nến ngày chạm cả hai mốc, bot tính là stop.
+Con số này không phải xác suất tương lai.
 
 Lệnh Telegram:
 
@@ -88,6 +102,8 @@ Lệnh Telegram:
 /signals_status
 /scan
 /deep FPT
+/news FPT
+/macro
 ```
 
 Biến cấu hình:
@@ -103,7 +119,7 @@ Biến cấu hình:
   thông báo cooldown ngay thay vì đứng chờ
 - `GEMINI_CACHE_TTL`: cache kết quả mỗi mã trong `1800` giây
 - `GEMINI_QUOTA_COOLDOWN`: khi gặp 429, ngừng gọi Gemini trong `900` giây
-- `RESEARCH_COMMAND_COOLDOWN`: `/deep` và `/scan` cách nhau ít nhất `60` giây;
+- `RESEARCH_COMMAND_COOLDOWN`: `/deep`, `/scan` và `/news` cách nhau ít nhất `60` giây;
   `/ping`, `/quote` và các lệnh thường không bị ảnh hưởng
 - `GEMINI_DAILY_BUDGET`: ngân sách an toàn nội bộ, mặc định `12` API call/ngày
 - `VNSTOCK_API_KEY`: key VNStock; bot tự ánh xạ thêm sang `VNDATA_API_KEY`
@@ -116,6 +132,11 @@ Biến cấu hình:
 - `VNSTOCK_CACHE_TTL`: cache lịch sử mỗi mã `480` giây
 - `DEEP_DAILY_LIMIT`: tối đa `10` lệnh `/deep` được nhận mỗi ngày
 - `SCAN_DAILY_LIMIT`: tối đa `2` lệnh `/scan` thủ công mỗi ngày
+- `NEWS_DAILY_LIMIT`: tối đa `8` lệnh `/news` hoặc `/macro` mỗi ngày
+- `VIMO_LATEST_URL`: mặc định đọc `vimo-VN/output/latest.json`
+- `VIMO_CACHE_TTL`: cache vĩ mô `900` giây
+- `NEWS_CACHE_TTL`: cache tiêu đề theo chủ đề `900` giây
+- `NEWS_MAX_ITEMS`: tối đa `5` tiêu đề có nguồn mỗi lần
 - `SCAN_WEEKDAYS`: ngày quét, định dạng số thứ trong tuần của Python; mặc định `0,3` là thứ Hai và thứ Năm
 - `SCAN_TIME`: giờ quét theo giờ máy, mặc định `20:30`
 - `SCAN_WORKERS`: mặc định `2`, tối đa nội bộ `12`; giảm tải đồng thời lên nguồn giá
@@ -160,7 +181,9 @@ Mỗi lệnh chỉ gọi Gemini tối đa hai lần (model chính và một mode
 gặp lỗi quota 429, bot mở circuit breaker và vẫn trả kết quả định lượng thay vì
 tiếp tục retry. Các lệnh `/start`, `/ping`, `/quote` không phụ thuộc Gemini.
 
-## Phạm vi hiện tại
+## Giới hạn cần hiểu đúng
 
-Đây là nền tảng MVP. Có thể bổ sung dữ liệu tài chính, định giá, tin tức và báo cáo
-định kỳ sau khi thống nhất nguồn dữ liệu và các lệnh cần thiết.
+TradingView và RSS có thể thiếu/chậm; tiêu đề không thay thế nội dung văn bản gốc.
+Đối với ngân hàng/bảo hiểm, D/E và current ratio không được chấm như doanh nghiệp
+thông thường; bot giữ điểm trung tính và nhắc so sánh theo ngành. Target/stop chỉ
+là kịch bản theo ATR/hỗ trợ gần để chuẩn hóa rủi ro, không phải mức giá bảo đảm.

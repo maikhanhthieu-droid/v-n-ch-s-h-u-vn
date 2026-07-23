@@ -12,6 +12,8 @@ Commands:
     /chart <TICKER>
     /ta <TICKER>
     /deep <TICKER>
+    /news <TICKER or TOPIC>
+    /macro [TOPIC]
     /scan
     /signals_on
     /signals_off
@@ -42,6 +44,7 @@ import sys
 import tempfile
 import threading
 import time
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
@@ -79,6 +82,7 @@ DEFAULT_RESEARCH_COMMAND_COOLDOWN = 60.0
 DEFAULT_GEMINI_DAILY_BUDGET = 12
 DEFAULT_DEEP_DAILY_LIMIT = 10
 DEFAULT_SCAN_DAILY_LIMIT = 2
+DEFAULT_NEWS_DAILY_LIMIT = 8
 DEFAULT_SCAN_WORKERS = 2
 DEFAULT_VNSTOCK_DAILY_BUDGET = 60
 DEFAULT_VNSTOCK_REQUESTS_PER_MINUTE = 12
@@ -86,6 +90,13 @@ DEFAULT_VNSTOCK_USAGE_RATIO = 0.70
 DEFAULT_VNSTOCK_ERROR_COOLDOWN = 300.0
 DEFAULT_VNSTOCK_CACHE_TTL = 480.0
 DEFAULT_VNSTOCK_SOURCES = "VCI,KBS"
+DEFAULT_VIMO_LATEST_URL = (
+    "https://raw.githubusercontent.com/maikhanhthieu-droid/"
+    "vimo-VN/main/output/latest.json"
+)
+DEFAULT_VIMO_CACHE_TTL = 900.0
+DEFAULT_NEWS_CACHE_TTL = 900.0
+DEFAULT_NEWS_MAX_ITEMS = 5
 
 VN100_SYMBOLS = [
     "AAA", "ACB", "ANV", "APH", "ASM", "BCM", "BID", "BMP", "BSI", "BVH",
@@ -162,7 +173,7 @@ class PriceBar:
 
 @dataclass(frozen=True)
 class FundamentalSnapshot:
-    """Valuation and price fields used by the VN100 signal scanner."""
+    """Business, valuation, and price fields used by the VN100 scanner."""
 
     symbol: str
     name: str
@@ -172,11 +183,99 @@ class FundamentalSnapshot:
     market_cap: float | None = None
     fifty_two_week_high: float | None = None
     fifty_two_week_low: float | None = None
+    sector: str | None = None
+    industry: str | None = None
+    total_revenue: float | None = None
+    revenue_growth: float | None = None
+    net_income: float | None = None
+    net_income_growth: float | None = None
+    return_on_equity: float | None = None
+    debt_to_equity: float | None = None
+    current_ratio: float | None = None
+    earnings_per_share: float | None = None
+    earnings_growth: float | None = None
+
+
+@dataclass(frozen=True)
+class MacroSource:
+    """A traceable source inherited from the vimo-VN macro repository."""
+
+    title: str
+    url: str
+    as_of: str = ""
+    quality: str = ""
+
+
+@dataclass(frozen=True)
+class MacroContext:
+    """Neutral macro state produced by vimo-VN."""
+
+    stance: str = "Chưa đủ dữ liệu"
+    score: float | None = None
+    summary: str = "Chưa tải được bối cảnh vĩ mô."
+    positive_drivers: tuple[str, ...] = ()
+    risk_drivers: tuple[str, ...] = ()
+    neutral_drivers: tuple[str, ...] = ()
+    generated_at: str = ""
+    confidence: str = ""
+    sources: tuple[MacroSource, ...] = ()
+    available: bool = False
+
+
+@dataclass(frozen=True)
+class ScoreBreakdown:
+    """Deterministic 100-point framework. Gemini may explain but not edit it."""
+
+    business: int
+    valuation: int
+    technical: int
+    risk: int
+    macro: int
+    total: int
+    pattern: str
+
+
+@dataclass(frozen=True)
+class TradePlan:
+    """Scenario levels derived from volatility; not a personalized order."""
+
+    entry_low: float
+    entry_high: float
+    stop: float
+    target_1: float
+    target_2: float
+    target_3: float
+    risk_pct: float
+    support: float | None = None
+    resistance: float | None = None
+
+
+@dataclass(frozen=True)
+class BacktestResult:
+    """Historical pattern outcomes. This is not a forecast probability."""
+
+    samples: int
+    wins: int
+    losses: int
+    unresolved: int
+    hit_rate: float | None
+    lookahead_sessions: int = 20
+    target_label: str = "T1"
+
+
+@dataclass(frozen=True)
+class NewsItem:
+    """Headline metadata from a public RSS feed."""
+
+    title: str
+    source: str
+    url: str
+    published_at: str = ""
 
 
 @dataclass(frozen=True)
 class DeepSignal:
-    """A candidate that survived the quantitative discount filter."""
+    """A candidate with deterministic scores and scenario statistics."""
 
     symbol: str
     score: int
@@ -184,6 +283,10 @@ class DeepSignal:
     quote: Quote
     bars: list[PriceBar]
     reasons: list[str]
+    breakdown: ScoreBreakdown | None = None
+    macro: MacroContext | None = None
+    trade_plan: TradePlan | None = None
+    backtest: BacktestResult | None = None
 
 
 def normalize_symbol(raw: str) -> str:
@@ -274,6 +377,260 @@ def _first_number(*values: Any) -> float | None:
         except (TypeError, ValueError):
             continue
     return None
+
+
+def _text_request(url: str, timeout: float, accept: str = "*/*") -> str:
+    request = Request(
+        url,
+        headers={
+            "Accept": accept,
+            "User-Agent": "vn-equity-bot/1.0 (+https://github.com/)",
+        },
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        raise BotError("Không tải được nguồn tin công khai lúc này.") from exc
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise BotError("Nguồn tin trả về định dạng không hợp lệ.") from exc
+
+
+def _string_items(value: Any, limit: int = 6) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    items: list[str] = []
+    for item in value:
+        if isinstance(item, dict):
+            text = str(
+                item.get("text")
+                or item.get("reason")
+                or item.get("name")
+                or item.get("label")
+                or ""
+            ).strip()
+        else:
+            text = str(item or "").strip()
+        if text and text not in items:
+            items.append(text)
+        if len(items) >= limit:
+            break
+    return tuple(items)
+
+
+class MacroContextClient:
+    """Read the latest neutral macro snapshot published by vimo-VN."""
+
+    RELEVANT_CARDS = {
+        "cpi",
+        "pmi",
+        "iip",
+        "retail_sales",
+        "interbank",
+        "usd_vnd",
+        "vnindex",
+        "dxy",
+        "oil",
+        "us10y",
+        "policy_actions_vn",
+        "trade_balance",
+    }
+
+    def __init__(
+        self,
+        url: str = DEFAULT_VIMO_LATEST_URL,
+        timeout: float = DEFAULT_YAHOO_TIMEOUT,
+        cache_ttl: float = DEFAULT_VIMO_CACHE_TTL,
+        fetcher: Callable[[str, float], dict[str, Any]] | None = None,
+    ):
+        self.url = url.strip() or DEFAULT_VIMO_LATEST_URL
+        self.timeout = max(2.0, float(timeout))
+        self.cache_ttl = max(0.0, float(cache_ttl))
+        self.fetcher = fetcher or _json_request
+        self._cache: tuple[float, MacroContext] | None = None
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _unavailable(summary: str) -> MacroContext:
+        return MacroContext(summary=summary, available=False)
+
+    @classmethod
+    def parse(cls, payload: dict[str, Any]) -> MacroContext:
+        strategy = payload.get("macro_strategy")
+        if not isinstance(strategy, dict):
+            return cls._unavailable("vimo-VN chưa xuất bản phần macro_strategy.")
+
+        score = _first_number(strategy.get("score"))
+        stance = str(strategy.get("stance") or "Chưa đủ dữ liệu").strip()
+        summary = str(
+            strategy.get("reason_short")
+            or strategy.get("summary")
+            or "Chưa có nhận định tóm tắt."
+        ).strip()
+        positive = _string_items(strategy.get("positive_drivers"))
+        risks = _string_items(strategy.get("risk_drivers"))
+        neutral = _string_items(strategy.get("neutral_drivers"))
+        confidence = str(strategy.get("confidence") or "").strip()
+        generated_at = str(
+            payload.get("generated_at_bkk")
+            or payload.get("generated_at")
+            or ""
+        ).strip()
+
+        cards_raw = payload.get("cards")
+        if isinstance(cards_raw, dict):
+            cards = list(cards_raw.values())
+        elif isinstance(cards_raw, list):
+            cards = cards_raw
+        else:
+            cards = []
+        sources: list[MacroSource] = []
+        seen_urls: set[str] = set()
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+            key = str(card.get("key") or "").strip().lower()
+            if key not in cls.RELEVANT_CARDS:
+                continue
+            url = str(card.get("source_url") or "").strip()
+            if not HTTP_URL_RE.match(url) or url in seen_urls:
+                continue
+            title = str(
+                card.get("source_primary")
+                or card.get("name_vi")
+                or key
+            ).strip()
+            sources.append(
+                MacroSource(
+                    title=title[:90],
+                    url=url,
+                    as_of=str(card.get("as_of") or "").strip(),
+                    quality=str(card.get("source_quality") or "").strip(),
+                )
+            )
+            seen_urls.add(url)
+            if len(sources) >= 6:
+                break
+        return MacroContext(
+            stance=stance,
+            score=score,
+            summary=summary,
+            positive_drivers=positive,
+            risk_drivers=risks,
+            neutral_drivers=neutral,
+            generated_at=generated_at,
+            confidence=confidence,
+            sources=tuple(sources),
+            available=True,
+        )
+
+    def latest(self) -> MacroContext:
+        now = time.monotonic()
+        with self._lock:
+            if self._cache and self._cache[0] > now:
+                return self._cache[1]
+        try:
+            context = self.parse(self.fetcher(self.url, self.timeout))
+        except (BotError, TypeError, ValueError) as exc:
+            LOG.warning("Cannot load vimo-VN macro context: %s", type(exc).__name__)
+            context = self._unavailable(
+                "Tạm thời chưa tải được vimo-VN; điểm vĩ mô được giữ ở mức trung tính."
+            )
+        with self._lock:
+            self._cache = (now + self.cache_ttl, context)
+        return context
+
+
+class NeutralNewsService:
+    """Fetch public Vietnamese headlines; interpretation remains source-bound."""
+
+    def __init__(
+        self,
+        timeout: float = DEFAULT_YAHOO_TIMEOUT,
+        cache_ttl: float = DEFAULT_NEWS_CACHE_TTL,
+        max_items: int = DEFAULT_NEWS_MAX_ITEMS,
+        fetcher: Callable[[str, float, str], str] | None = None,
+    ):
+        self.timeout = max(2.0, float(timeout))
+        self.cache_ttl = max(0.0, float(cache_ttl))
+        self.max_items = max(1, min(int(max_items), 10))
+        self.fetcher = fetcher or _text_request
+        self._cache: dict[str, tuple[float, list[NewsItem]]] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _parse_rss(raw: str, max_items: int) -> list[NewsItem]:
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError as exc:
+            raise BotError("Nguồn RSS tin tức trả về định dạng không hợp lệ.") from exc
+        results: list[NewsItem] = []
+        seen_titles: set[str] = set()
+        for item in root.findall(".//item"):
+            title_node = item.find("title")
+            link_node = item.find("link")
+            source_node = item.find("source")
+            date_node = item.find("pubDate")
+            title = html.unescape(
+                "".join(title_node.itertext()) if title_node is not None else ""
+            ).strip()
+            url = (
+                "".join(link_node.itertext()).strip()
+                if link_node is not None
+                else ""
+            )
+            source = (
+                html.unescape("".join(source_node.itertext())).strip()
+                if source_node is not None
+                else "Nguồn RSS"
+            )
+            published_at = (
+                "".join(date_node.itertext()).strip()
+                if date_node is not None
+                else ""
+            )
+            normalized_title = re.sub(r"\s+", " ", title)
+            if (
+                not normalized_title
+                or normalized_title.lower() in seen_titles
+                or not HTTP_URL_RE.match(url)
+            ):
+                continue
+            seen_titles.add(normalized_title.lower())
+            results.append(
+                NewsItem(
+                    title=normalized_title[:240],
+                    source=source[:80],
+                    url=url,
+                    published_at=published_at[:80],
+                )
+            )
+            if len(results) >= max_items:
+                break
+        return results
+
+    def headlines(self, topic: str) -> list[NewsItem]:
+        clean_topic = re.sub(r"\s+", " ", topic).strip()[:120]
+        if not clean_topic:
+            return []
+        cache_key = clean_topic.casefold()
+        now = time.monotonic()
+        with self._lock:
+            cached = self._cache.get(cache_key)
+            if cached and cached[0] > now:
+                return list(cached[1])
+        query = f"{clean_topic} (doanh nghiệp OR kinh tế OR chứng khoán OR thông tư)"
+        url = (
+            "https://news.google.com/rss/search?"
+            f"q={url_quote(query)}&hl=vi&gl=VN&ceid=VN:vi"
+        )
+        raw = self.fetcher(url, self.timeout, "application/rss+xml, application/xml")
+        results = self._parse_rss(raw, self.max_items)
+        with self._lock:
+            self._cache[cache_key] = (now + self.cache_ttl, list(results))
+        return results
 
 
 class YahooQuoteProvider:
@@ -421,6 +778,17 @@ class YahooQuoteProvider:
                     "price_earnings_ttm",
                     "price_book_fq",
                     "market_cap_basic",
+                    "sector",
+                    "industry",
+                    "total_revenue",
+                    "total_revenue_yoy_growth_ttm",
+                    "net_income",
+                    "net_income_yoy_growth_ttm",
+                    "return_on_equity_fq",
+                    "debt_to_equity_fq",
+                    "current_ratio_fq",
+                    "earnings_per_share_diluted_ttm",
+                    "earnings_per_share_diluted_yoy_growth_ttm",
                 ],
             },
             self.timeout,
@@ -444,6 +812,17 @@ class YahooQuoteProvider:
                 trailing_pe=_first_number(values[3]),
                 price_to_book=_first_number(values[4]),
                 market_cap=_first_number(values[5]),
+                sector=str(values[6]).strip() if len(values) > 6 and values[6] else None,
+                industry=str(values[7]).strip() if len(values) > 7 and values[7] else None,
+                total_revenue=_first_number(values[8]) if len(values) > 8 else None,
+                revenue_growth=_first_number(values[9]) if len(values) > 9 else None,
+                net_income=_first_number(values[10]) if len(values) > 10 else None,
+                net_income_growth=_first_number(values[11]) if len(values) > 11 else None,
+                return_on_equity=_first_number(values[12]) if len(values) > 12 else None,
+                debt_to_equity=_first_number(values[13]) if len(values) > 13 else None,
+                current_ratio=_first_number(values[14]) if len(values) > 14 else None,
+                earnings_per_share=_first_number(values[15]) if len(values) > 15 else None,
+                earnings_growth=_first_number(values[16]) if len(values) > 16 else None,
             )
             snapshots[ticker] = snapshot
             self._fundamental_cache[ticker] = (now, snapshot)
@@ -1128,7 +1507,13 @@ class SignalStore:
 class ApiUsageStore:
     """Persist conservative daily counters used to protect upstream quotas."""
 
-    COUNTERS = ("gemini_requests", "vnstock_requests", "deep_commands", "scan_commands")
+    COUNTERS = (
+        "gemini_requests",
+        "vnstock_requests",
+        "deep_commands",
+        "scan_commands",
+        "news_commands",
+    )
 
     def __init__(
         self,
@@ -1137,6 +1522,7 @@ class ApiUsageStore:
         vnstock_daily_budget: int = DEFAULT_VNSTOCK_DAILY_BUDGET,
         deep_daily_limit: int = DEFAULT_DEEP_DAILY_LIMIT,
         scan_daily_limit: int = DEFAULT_SCAN_DAILY_LIMIT,
+        news_daily_limit: int = DEFAULT_NEWS_DAILY_LIMIT,
     ):
         self.path = path
         self.limits = {
@@ -1144,6 +1530,7 @@ class ApiUsageStore:
             "vnstock_requests": max(1, int(vnstock_daily_budget)),
             "deep_commands": max(1, int(deep_daily_limit)),
             "scan_commands": max(1, int(scan_daily_limit)),
+            "news_commands": max(1, int(news_daily_limit)),
         }
         self._lock = threading.Lock()
         self._data: dict[str, Any] = self._empty_data()
@@ -1239,6 +1626,7 @@ class ApiUsageStore:
         vnstock = data["vnstock_requests"]
         deep = data["deep_commands"]
         scan = data["scan_commands"]
+        news = data["news_commands"]
         return (
             "<b>Ngân sách API an toàn hôm nay</b>\n"
             f"Gemini: {gemini['used']}/{gemini['limit']} "
@@ -1249,6 +1637,8 @@ class ApiUsageStore:
             f"— {self._meter(deep['used'], deep['limit'])}\n"
             f"/scan: {scan['used']}/{scan['limit']} "
             f"— {self._meter(scan['used'], scan['limit'])}\n"
+            f"/news: {news['used']}/{news['limit']} "
+            f"— {self._meter(news['used'], news['limit'])}\n"
             f"Trạng thái Gemini: {html.escape(gemini_status)}\n"
             "Đặt lại lúc 00:00 (UTC+7). Đây là bộ đếm nội bộ, không phải quota trực tiếp từ nhà cung cấp."
         )
@@ -1404,10 +1794,10 @@ class GeminiAnalyzer:
         snapshot = signal.snapshot
         quote = signal.quote
         closes = [bar.close for bar in signal.bars]
-        high_values = [bar.high for bar in signal.bars if bar.high is not None]
-        low_values = [bar.low for bar in signal.bars if bar.low is not None]
-        high_52w = snapshot.fifty_two_week_high or (max(high_values) if high_values else None)
-        low_52w = snapshot.fifty_two_week_low or (min(low_values) if low_values else None)
+        breakdown = signal.breakdown
+        plan = signal.trade_plan
+        backtest = signal.backtest
+        macro = signal.macro or MacroContext()
         web_instruction = (
             "Hãy dùng Google Search để kiểm tra thông tin mới nhất từ nguồn sơ cấp/đáng tin "
             "(công bố doanh nghiệp, HOSE/HNX/SSC, báo cáo tài chính hoặc báo chí tài chính uy tín). "
@@ -1415,30 +1805,43 @@ class GeminiAnalyzer:
             "hãy nói thẳng là chưa đủ dữ liệu."
             if allow_search
             else
-            "Google Search hiện không khả dụng. Chỉ được dùng các số liệu hệ thống cung cấp; "
-            "không được tự đưa tin, số liệu kết quả kinh doanh, mục tiêu giá hoặc sự kiện hiện tại "
-            "không xuất hiện trong dữ liệu đầu vào. Với phần tin tức, ghi rõ là chưa có dữ liệu."
+            "Chỉ được dùng các số liệu hệ thống và bối cảnh vimo-VN cung cấp; không được tự "
+            "đưa tin, số liệu kết quả kinh doanh hay sự kiện không xuất hiện trong đầu vào."
         )
         return (
             "Bạn là chuyên viên hỗ trợ nghiên cứu cổ phiếu Việt Nam. Dữ liệu định lượng "
             "bên dưới do hệ thống cung cấp; không được tự sửa, suy diễn hoặc bịa số còn thiếu. "
             f"{web_instruction} "
-            "Không khẳng định lợi nhuận và không ra lệnh mua/bán.\n\n"
+            "Điểm 100, target/stop và backtest là kết quả cố định của hệ thống: chỉ được giải "
+            "thích, không được thay đổi. Không gọi hit-rate là xác suất tương lai, không khẳng "
+            "định lợi nhuận và không ra lệnh mua/bán.\n\n"
             f"Ngày phân tích: {datetime.now().strftime('%Y-%m-%d')}\n"
             f"Mã: {signal.symbol}\n"
             f"Tên: {snapshot.name}\n"
+            f"Ngành: {snapshot.sector} / {snapshot.industry}\n"
             f"Giá: {quote.price}\n"
+            f"Doanh thu YoY: {snapshot.revenue_growth}%\n"
+            f"Lợi nhuận YoY: {snapshot.net_income_growth}%\n"
+            f"ROE: {snapshot.return_on_equity}%\n"
+            f"D/E: {snapshot.debt_to_equity}x\n"
+            f"Current ratio: {snapshot.current_ratio}\n"
             f"P/E: {snapshot.trailing_pe}\n"
             f"P/B: {snapshot.price_to_book}\n"
-            f"Đỉnh 52 tuần: {high_52w}\n"
-            f"Đáy 52 tuần: {low_52w}\n"
             f"MA20: {moving_average(closes, 20)}\n"
+            f"MA50: {moving_average(closes, 50)}\n"
+            f"MA200: {moving_average(closes, 200)}\n"
             f"RSI14: {rsi(closes, 14)}\n"
-            f"Điểm lọc: {signal.score}/100\n"
+            f"Điểm tổng: {signal.score}/100\n"
+            f"Điểm thành phần: {breakdown}\n"
+            f"Kịch bản target/stop: {plan}\n"
+            f"Backtest trạng thái tương tự: {backtest}\n"
+            f"Vĩ mô vimo-VN: stance={macro.stance}; score={macro.score}; "
+            f"summary={macro.summary}; tích cực={macro.positive_drivers}; "
+            f"rủi ro={macro.risk_drivers}; confidence={macro.confidence}\n"
             f"Lý do lọc: {', '.join(signal.reasons)}\n\n"
-            "Trả lời tiếng Việt ngắn gọn theo đúng 6 mục, mỗi mục 1–2 câu: "
-            "1) Định giá; 2) Xu hướng giá; 3) Kết quả kinh doanh/tin mới đã kiểm chứng; "
-            "4) Chất xúc tác; 5) Rủi ro lớn nhất; 6) Điều kiện để đưa vào vùng theo dõi. "
+            "Trả lời tiếng Việt ngắn gọn theo đúng 5 mục, mỗi mục 1–2 câu: "
+            "1) Chất lượng doanh nghiệp; 2) Định giá; 3) Mẫu hình và điều kiện xác nhận/hủy; "
+            "4) Vĩ mô theo hai chiều tích cực-rủi ro; 5) Điều còn thiếu cần kiểm chứng. "
             "Không chèn bảng và không tự viết danh sách nguồn vì hệ thống sẽ gắn nguồn."
         )
 
@@ -1630,6 +2033,66 @@ class GeminiAnalyzer:
                 return self._quota_message()
             return "Gemini không phản hồi lúc này; bot chỉ gửi phần chấm điểm định lượng."
 
+    def analyze_news(
+        self,
+        topic: str,
+        items: list[NewsItem],
+        macro: MacroContext,
+    ) -> str:
+        """Analyze supplied headlines without inventing article details."""
+
+        if not self.enabled():
+            return (
+                "Gemini chưa có API key; bot chỉ hiển thị tiêu đề có nguồn và "
+                "bối cảnh vĩ mô định lượng."
+            )
+        cache_key = f"NEWS:{topic.casefold()}"
+        cached = self._cached_result(cache_key)
+        if cached is not None:
+            return cached + "\n\n(Kết quả được lấy từ cache để tiết kiệm quota.)"
+        if self._quota_remaining() > 0:
+            return self._quota_message()
+        headline_lines = "\n".join(
+            f"- [{item.source}] {item.title} ({item.published_at or 'không rõ ngày'})"
+            for item in items
+        ) or "- Không có tiêu đề phù hợp từ RSS."
+        prompt = (
+            "Bạn phân tích tin doanh nghiệp và vĩ mô Việt Nam theo góc nhìn trung lập. "
+            "Chỉ được dùng metadata tiêu đề/nguồn bên dưới; không được giả định đã đọc toàn "
+            "bài, không tự bịa nội dung thông tư, số điều, mức tác động hay số liệu. Một tiêu "
+            "đề không phải bằng chứng cho quan hệ nhân quả. Nếu các nguồn mâu thuẫn hoặc chưa "
+            "đủ dữ kiện, phải ghi rõ. Không ra lệnh mua/bán.\n\n"
+            f"Chủ đề: {topic}\n"
+            f"Tiêu đề công khai:\n{headline_lines}\n\n"
+            f"Bối cảnh vimo-VN: stance={macro.stance}; score={macro.score}; "
+            f"summary={macro.summary}; tích cực={macro.positive_drivers}; "
+            f"rủi ro={macro.risk_drivers}; trung tính={macro.neutral_drivers}; "
+            f"confidence={macro.confidence}\n\n"
+            "Trả lời tiếng Việt, tối đa 700 từ, theo 4 mục: "
+            "1) Dữ kiện có thể xác nhận từ tiêu đề; 2) Kênh tác động tích cực; "
+            "3) Kênh tác động tiêu cực/rủi ro; 4) Điều cần mở văn bản gốc hoặc công bố "
+            "doanh nghiệp để kiểm chứng. Không thêm danh sách nguồn vì hệ thống tự gắn."
+        )
+        try:
+            result = self._analyze_interactions(prompt, use_search=False)
+            self._store_cached_result(cache_key, result)
+            return result
+        except GeminiRequestCooldown as cooldown_exc:
+            return self._rate_message(cooldown_exc.remaining)
+        except GeminiDailyBudgetReached:
+            return self._daily_budget_message()
+        except GeminiQuotaCircuitOpen:
+            return self._quota_message()
+        except Exception as exc:
+            LOG.warning("Gemini news analysis failed: %s", type(exc).__name__)
+            if self._is_quota_error(exc):
+                self._open_quota_circuit()
+                return self._quota_message()
+            return (
+                "Gemini không phản hồi lúc này; bot vẫn giữ danh sách tiêu đề có nguồn "
+                "và bối cảnh vimo-VN để bạn tự kiểm chứng."
+            )
+
 
 def parse_symbols(raw: str | None) -> list[str]:
     if not raw:
@@ -1647,82 +2110,673 @@ def parse_symbols(raw: str | None) -> list[str]:
     return symbols or list(VN100_SYMBOLS)
 
 
+def _clamp_points(value: float, maximum: int) -> int:
+    return max(0, min(maximum, int(round(value))))
+
+
+def average_true_range(bars: list[PriceBar], window: int = 14) -> float | None:
+    if len(bars) < 2:
+        return None
+    true_ranges: list[float] = []
+    previous_close = bars[0].close
+    for bar in bars[1:]:
+        high = bar.high if bar.high is not None else bar.close
+        low = bar.low if bar.low is not None else bar.close
+        true_ranges.append(
+            max(
+                high - low,
+                abs(high - previous_close),
+                abs(low - previous_close),
+            )
+        )
+        previous_close = bar.close
+    if not true_ranges:
+        return None
+    sample = true_ranges[-window:]
+    return sum(sample) / len(sample)
+
+
+def _technical_profile(
+    bars: list[PriceBar],
+    price: float,
+) -> tuple[str, dict[str, float | None]]:
+    closes = [bar.close for bar in bars]
+    ma20 = moving_average(closes, 20)
+    ma50 = moving_average(closes, 50)
+    ma200 = moving_average(closes, 200)
+    rsi14 = rsi(closes, 14)
+    recent_before = closes[-21:-1] if len(closes) >= 21 else closes[:-1]
+    prior_high = max(recent_before) if recent_before else None
+    volumes = [float(bar.volume) for bar in bars[-21:-1] if bar.volume is not None]
+    average_volume = sum(volumes) / len(volumes) if volumes else None
+    latest_volume = float(bars[-1].volume) if bars and bars[-1].volume is not None else None
+    volume_ratio = (
+        latest_volume / average_volume
+        if latest_volume is not None and average_volume and average_volume > 0
+        else None
+    )
+
+    breakout = (
+        prior_high is not None
+        and price >= prior_high
+        and volume_ratio is not None
+        and volume_ratio >= 1.2
+    )
+    uptrend = (
+        ma20 is not None
+        and ma50 is not None
+        and price >= ma20
+        and ma20 >= ma50
+        and (ma200 is None or ma50 >= ma200)
+    )
+    pullback = (
+        ma20 is not None
+        and ma50 is not None
+        and ma20 >= ma50
+        and ma20 * 0.97 <= price <= ma20 * 1.03
+    )
+    if breakout:
+        pattern = "bứt phá có xác nhận khối lượng"
+    elif pullback:
+        pattern = "điều chỉnh về MA20 trong xu hướng tăng"
+    elif uptrend:
+        pattern = "xu hướng tăng"
+    elif ma20 is not None and ma50 is not None and abs(ma20 / ma50 - 1.0) <= 0.03:
+        pattern = "tích lũy/đi ngang"
+    elif ma20 is not None and price < ma20:
+        pattern = "xu hướng yếu, chưa xác nhận đảo chiều"
+    else:
+        pattern = "chưa đủ dữ liệu nhận dạng"
+    return pattern, {
+        "ma20": ma20,
+        "ma50": ma50,
+        "ma200": ma200,
+        "rsi14": rsi14,
+        "volume_ratio": volume_ratio,
+    }
+
+
+def build_score_breakdown(
+    snapshot: FundamentalSnapshot,
+    quote: Quote,
+    bars: list[PriceBar],
+    macro: MacroContext | None = None,
+) -> tuple[ScoreBreakdown, list[str]]:
+    """Score five auditable dimensions; missing data receives neutral/low points."""
+
+    reasons: list[str] = []
+    price = snapshot.price or quote.price
+
+    # 1) Business quality: 30 points.
+    revenue_growth = snapshot.revenue_growth
+    if revenue_growth is None:
+        revenue_points = 2
+    elif revenue_growth >= 15:
+        revenue_points = 5
+        reasons.append(f"doanh thu tăng {revenue_growth:.1f}%")
+    elif revenue_growth >= 5:
+        revenue_points = 4
+    elif revenue_growth >= 0:
+        revenue_points = 3
+    elif revenue_growth >= -10:
+        revenue_points = 1
+        reasons.append(f"doanh thu giảm {abs(revenue_growth):.1f}%")
+    else:
+        revenue_points = 0
+        reasons.append(f"doanh thu giảm mạnh {abs(revenue_growth):.1f}%")
+
+    profit_growth = snapshot.net_income_growth
+    if profit_growth is None:
+        profit_points = 2
+    elif profit_growth >= 20:
+        profit_points = 5
+        reasons.append(f"lợi nhuận tăng {profit_growth:.1f}%")
+    elif profit_growth >= 8:
+        profit_points = 4
+    elif profit_growth >= 0:
+        profit_points = 3
+    elif profit_growth >= -15:
+        profit_points = 1
+        reasons.append(f"lợi nhuận giảm {abs(profit_growth):.1f}%")
+    else:
+        profit_points = 0
+        reasons.append(f"lợi nhuận giảm mạnh {abs(profit_growth):.1f}%")
+
+    roe = snapshot.return_on_equity
+    if roe is None:
+        roe_points = 5
+    elif roe >= 20:
+        roe_points = 10
+        reasons.append(f"ROE cao {roe:.1f}%")
+    elif roe >= 12:
+        roe_points = 8
+    elif roe >= 8:
+        roe_points = 6
+    elif roe > 0:
+        roe_points = 3
+    else:
+        roe_points = 0
+        reasons.append("ROE không dương")
+
+    sector_text = f"{snapshot.sector or ''} {snapshot.industry or ''}".casefold()
+    is_financial = any(
+        token in sector_text
+        for token in ("finance", "bank", "insurance", "financial", "ngân hàng")
+    )
+    if is_financial:
+        balance_points = 5
+        reasons.append("đòn bẩy ngành tài chính cần so với nhóm đồng ngành")
+    else:
+        debt = snapshot.debt_to_equity
+        current = snapshot.current_ratio
+        if debt is None:
+            debt_points = 2
+        elif debt < 0.5:
+            debt_points = 5
+        elif debt < 1.0:
+            debt_points = 4
+        elif debt < 1.5:
+            debt_points = 2
+        else:
+            debt_points = 0
+            reasons.append(f"D/E cao {debt:.2f}x")
+        if current is None:
+            current_points = 2
+        elif current >= 1.5:
+            current_points = 5
+        elif current >= 1.0:
+            current_points = 4
+        elif current >= 0.7:
+            current_points = 2
+        else:
+            current_points = 0
+            reasons.append(f"thanh toán hiện hành thấp {current:.2f}")
+        balance_points = debt_points + current_points
+    business = _clamp_points(
+        revenue_points + profit_points + roe_points + balance_points,
+        30,
+    )
+
+    # 2) Valuation: 25 points.
+    pe = snapshot.trailing_pe
+    if pe is None:
+        pe_points = 5
+    elif 0 < pe <= 8:
+        pe_points = 12
+        reasons.append(f"P/E thấp {pe:.2f}")
+    elif pe <= 12:
+        pe_points = 10
+    elif pe <= 18:
+        pe_points = 8
+    elif pe <= 25:
+        pe_points = 5
+    elif pe <= 40:
+        pe_points = 2
+    else:
+        pe_points = 0
+        if pe <= 0:
+            reasons.append("P/E không có ý nghĩa do lợi nhuận không dương")
+
+    pb = snapshot.price_to_book
+    if pb is None:
+        pb_points = 3
+    elif 0 < pb <= 1:
+        pb_points = 8
+        reasons.append(f"P/B thấp {pb:.2f}")
+    elif pb <= 1.5:
+        pb_points = 7
+    elif pb <= 2.5:
+        pb_points = 5
+    elif pb <= 4:
+        pb_points = 2
+    else:
+        pb_points = 0
+
+    growth_for_peg = snapshot.earnings_growth
+    if growth_for_peg is None:
+        growth_for_peg = snapshot.net_income_growth
+    if pe is not None and pe > 0 and growth_for_peg is not None and growth_for_peg > 0:
+        peg = pe / growth_for_peg
+        if peg <= 0.75:
+            growth_points = 5
+        elif peg <= 1.25:
+            growth_points = 4
+        elif peg <= 2:
+            growth_points = 2
+        else:
+            growth_points = 0
+    else:
+        growth_points = 2 if growth_for_peg is None else 0
+    valuation = _clamp_points(pe_points + pb_points + growth_points, 25)
+
+    # 3) Trend, momentum, pattern, and volume: 25 points.
+    pattern, profile = _technical_profile(bars, price)
+    ma20 = profile["ma20"]
+    ma50 = profile["ma50"]
+    ma200 = profile["ma200"]
+    rsi14 = profile["rsi14"]
+    volume_ratio = profile["volume_ratio"]
+    trend_points = 0
+    if ma20 is not None and price >= ma20:
+        trend_points += 3
+    if ma20 is not None and ma50 is not None and ma20 >= ma50:
+        trend_points += 4
+    if ma50 is not None and ma200 is not None and ma50 >= ma200:
+        trend_points += 5
+    if rsi14 is None:
+        momentum_points = 2
+    elif 45 <= rsi14 <= 65:
+        momentum_points = 5
+    elif 35 <= rsi14 <= 70:
+        momentum_points = 4
+    elif 30 <= rsi14 <= 75:
+        momentum_points = 2
+    else:
+        momentum_points = 0
+        reasons.append(f"RSI14 ở vùng cực trị {rsi14:.1f}")
+    pattern_points = {
+        "bứt phá có xác nhận khối lượng": 5,
+        "điều chỉnh về MA20 trong xu hướng tăng": 4,
+        "xu hướng tăng": 4,
+        "tích lũy/đi ngang": 3,
+        "xu hướng yếu, chưa xác nhận đảo chiều": 0,
+        "chưa đủ dữ liệu nhận dạng": 1,
+    }.get(pattern, 1)
+    if volume_ratio is None:
+        volume_points = 1
+    elif volume_ratio >= 1.2:
+        volume_points = 3
+    elif volume_ratio >= 0.8:
+        volume_points = 2
+    else:
+        volume_points = 1
+    technical = _clamp_points(
+        trend_points + momentum_points + pattern_points + volume_points,
+        25,
+    )
+    reasons.append(f"mẫu hình: {pattern}")
+
+    # 4) Volatility and liquidity risk: 10 points.
+    closes = [bar.close for bar in bars]
+    returns = [
+        current / previous - 1.0
+        for previous, current in zip(closes[:-1], closes[1:])
+        if previous > 0
+    ]
+    if len(returns) >= 20:
+        mean_return = sum(returns) / len(returns)
+        variance = sum((item - mean_return) ** 2 for item in returns) / len(returns)
+        annual_volatility = math.sqrt(variance) * math.sqrt(252) * 100
+        if annual_volatility <= 20:
+            volatility_points = 5
+        elif annual_volatility <= 30:
+            volatility_points = 4
+        elif annual_volatility <= 45:
+            volatility_points = 3
+        elif annual_volatility <= 60:
+            volatility_points = 1
+        else:
+            volatility_points = 0
+            reasons.append(f"biến động năm hóa cao {annual_volatility:.1f}%")
+    else:
+        volatility_points = 2
+    trading_values = [
+        bar.close * float(bar.volume)
+        for bar in bars[-20:]
+        if bar.volume is not None and bar.volume > 0
+    ]
+    average_trading_value = (
+        sum(trading_values) / len(trading_values) if trading_values else None
+    )
+    if average_trading_value is None:
+        liquidity_points = 2
+    elif average_trading_value >= 20_000_000_000:
+        liquidity_points = 5
+    elif average_trading_value >= 5_000_000_000:
+        liquidity_points = 4
+    elif average_trading_value >= 1_000_000_000:
+        liquidity_points = 3
+    elif average_trading_value >= 200_000_000:
+        liquidity_points = 1
+    else:
+        liquidity_points = 0
+        reasons.append("giá trị giao dịch bình quân thấp")
+    risk_points = _clamp_points(volatility_points + liquidity_points, 10)
+
+    # 5) vimo-VN macro overlay: 10 points, neutral when unavailable.
+    if macro is not None and macro.available and macro.score is not None:
+        macro_points = _clamp_points(5 + macro.score / 2.0, 10)
+    else:
+        macro_points = 5
+    total = business + valuation + technical + risk_points + macro_points
+    breakdown = ScoreBreakdown(
+        business=business,
+        valuation=valuation,
+        technical=technical,
+        risk=risk_points,
+        macro=macro_points,
+        total=_clamp_points(total, 100),
+        pattern=pattern,
+    )
+    if not reasons:
+        reasons.append("dữ liệu hiện tại chưa tạo ra điểm nổi bật")
+    return breakdown, reasons
+
+
 def score_candidate(
     snapshot: FundamentalSnapshot,
     quote: Quote,
     bars: list[PriceBar],
+    macro: MacroContext | None = None,
 ) -> tuple[int, list[str]]:
-    score = 0
-    reasons: list[str] = []
-    price = snapshot.price or quote.price
-    high_values = [bar.high for bar in bars if bar.high is not None]
-    low_values = [bar.low for bar in bars if bar.low is not None]
-    high_52w = snapshot.fifty_two_week_high or (max(high_values) if high_values else None)
-    low_52w = snapshot.fifty_two_week_low or (min(low_values) if low_values else None)
-    if high_52w and price:
-        drawdown_pct = (price / high_52w - 1.0) * 100.0
-        if drawdown_pct <= -30:
-            score += 30
-            reasons.append(f"chiết khấu {drawdown_pct:.1f}% so với đỉnh 52 tuần")
-        elif drawdown_pct <= -20:
-            score += 20
-            reasons.append(f"chiết khấu {drawdown_pct:.1f}% so với đỉnh 52 tuần")
-    if low_52w and high_52w and price and high_52w > low_52w:
-        range_position = (price - low_52w) / (high_52w - low_52w)
-        if range_position <= 0.35:
-            score += 10
-            reasons.append("giá đang ở nửa thấp của biên 52 tuần")
-    if snapshot.trailing_pe is not None:
-        if 0 < snapshot.trailing_pe <= 10:
-            score += 25
-            reasons.append(f"P/E thấp ({snapshot.trailing_pe:.2f})")
-        elif 10 < snapshot.trailing_pe <= 15:
-            score += 15
-            reasons.append(f"P/E hợp lý ({snapshot.trailing_pe:.2f})")
-    if snapshot.price_to_book is not None:
-        if 0 < snapshot.price_to_book <= 1.2:
-            score += 25
-            reasons.append(f"P/B thấp ({snapshot.price_to_book:.2f})")
-        elif 1.2 < snapshot.price_to_book <= 1.8:
-            score += 15
-            reasons.append(f"P/B chưa quá cao ({snapshot.price_to_book:.2f})")
+    breakdown, reasons = build_score_breakdown(snapshot, quote, bars, macro)
+    return breakdown.total, reasons
+
+
+def build_trade_plan(quote: Quote, bars: list[PriceBar]) -> TradePlan:
+    price = quote.price
+    atr14 = average_true_range(bars, 14)
+    atr_risk = 1.5 * atr14 if atr14 is not None else price * 0.05
+    recent = bars[-20:]
+    lows = [
+        bar.low if bar.low is not None else bar.close
+        for bar in recent
+    ]
+    highs = [
+        bar.high if bar.high is not None else bar.close
+        for bar in recent
+    ]
+    support = min(lows) if lows else None
+    resistance = max(highs) if highs else None
+    risk_distance = max(price * 0.03, atr_risk)
+    if support is not None and 0 < support < price:
+        risk_distance = max(risk_distance, min(price - support, price * 0.10))
+    risk_distance = min(risk_distance, price * 0.10)
+    stop = price - risk_distance
+    return TradePlan(
+        entry_low=price * 0.99,
+        entry_high=price * 1.01,
+        stop=stop,
+        target_1=price + risk_distance,
+        target_2=price + 2 * risk_distance,
+        target_3=price + 3 * risk_distance,
+        risk_pct=risk_distance / price * 100 if price else 0.0,
+        support=support,
+        resistance=resistance,
+    )
+
+
+def _market_signature(closes: list[float], index: int) -> tuple[int, int] | None:
+    if index < 50:
+        return None
+    segment = closes[: index + 1]
+    price = closes[index]
+    ma20 = sum(closes[index - 19 : index + 1]) / 20
+    ma50 = sum(closes[index - 49 : index + 1]) / 50
+    ma200 = (
+        sum(closes[index - 199 : index + 1]) / 200
+        if index >= 199
+        else None
+    )
+    if price >= ma20 and ma20 >= ma50 and (ma200 is None or ma50 >= ma200):
+        trend_state = 1
+    elif price < ma20 and ma20 < ma50:
+        trend_state = -1
+    else:
+        trend_state = 0
+    current_rsi = rsi(segment, 14)
+    if current_rsi is None:
+        rsi_bucket = 1
+    elif current_rsi < 35:
+        rsi_bucket = 0
+    elif current_rsi <= 65:
+        rsi_bucket = 1
+    else:
+        rsi_bucket = 2
+    return trend_state, rsi_bucket
+
+
+def backtest_similar_patterns(
+    bars: list[PriceBar],
+    plan: TradePlan,
+    lookahead_sessions: int = 20,
+) -> BacktestResult:
+    """Test T1-before-stop on similar trend/RSI states, conservatively."""
+
     closes = [bar.close for bar in bars]
-    rsi14 = rsi(closes, 14)
-    ma20 = moving_average(closes, 20)
-    if rsi14 is not None:
-        if rsi14 <= 35:
-            score += 15
-            reasons.append(f"RSI14 thấp ({rsi14:.2f})")
-        elif rsi14 <= 45:
-            score += 8
-            reasons.append(f"RSI14 hạ nhiệt ({rsi14:.2f})")
-    if ma20 and price and price >= ma20 * 0.97:
-        score += 5
-        reasons.append("giá không quá xa MA20")
-    if not reasons:
-        reasons.append("chưa có chiết khấu/định giá đủ nổi bật")
-    return min(score, 100), reasons
+    if len(closes) < 80 or plan.risk_pct <= 0:
+        return BacktestResult(0, 0, 0, 0, None, lookahead_sessions)
+    current_signature = _market_signature(closes, len(closes) - 1)
+    if current_signature is None:
+        return BacktestResult(0, 0, 0, 0, None, lookahead_sessions)
+    candidate_indices: list[int] = []
+    last_possible = len(closes) - lookahead_sessions - 2
+    for index in range(50, max(50, last_possible + 1)):
+        if _market_signature(closes, index) == current_signature:
+            candidate_indices.append(index)
+    candidate_indices = candidate_indices[-40:]
+    risk_ratio = plan.risk_pct / 100.0
+    wins = 0
+    losses = 0
+    unresolved = 0
+    for index in candidate_indices:
+        entry = closes[index]
+        target = entry * (1.0 + risk_ratio)
+        stop = entry * (1.0 - risk_ratio)
+        outcome = ""
+        for bar in bars[index + 1 : index + 1 + lookahead_sessions]:
+            high = bar.high if bar.high is not None else bar.close
+            low = bar.low if bar.low is not None else bar.close
+            hit_target = high >= target
+            hit_stop = low <= stop
+            if hit_stop:
+                # If both are touched in one daily candle, count the stop first.
+                outcome = "loss"
+                break
+            if hit_target:
+                outcome = "win"
+                break
+        if outcome == "win":
+            wins += 1
+        elif outcome == "loss":
+            losses += 1
+        else:
+            unresolved += 1
+    resolved = wins + losses
+    hit_rate = wins / resolved * 100 if resolved >= 5 else None
+    return BacktestResult(
+        samples=len(candidate_indices),
+        wins=wins,
+        losses=losses,
+        unresolved=unresolved,
+        hit_rate=hit_rate,
+        lookahead_sessions=lookahead_sessions,
+    )
+
+
+def build_deep_signal(
+    symbol: str,
+    snapshot: FundamentalSnapshot,
+    quote: Quote,
+    bars: list[PriceBar],
+    macro: MacroContext | None = None,
+) -> DeepSignal:
+    breakdown, reasons = build_score_breakdown(snapshot, quote, bars, macro)
+    plan = build_trade_plan(quote, bars)
+    backtest = backtest_similar_patterns(bars, plan)
+    return DeepSignal(
+        symbol=symbol,
+        score=breakdown.total,
+        snapshot=snapshot,
+        quote=quote,
+        bars=bars,
+        reasons=reasons,
+        breakdown=breakdown,
+        macro=macro,
+        trade_plan=plan,
+        backtest=backtest,
+    )
+
+
+def _plain_excerpt(text: str, maximum: int) -> str:
+    clean = re.sub(r"\s+\n", "\n", str(text or "").strip())
+    if len(clean) <= maximum:
+        return clean
+    return clean[: max(0, maximum - 1)].rstrip() + "…"
+
+
+def _compose_telegram_html(
+    prefix: str,
+    plain_text: str,
+    suffix: str,
+    limit: int = 4090,
+) -> str:
+    """Fit escaped model text without cutting an HTML entity or closing tag."""
+
+    clean = str(plain_text or "").strip()
+    while clean:
+        rendered = prefix + html.escape(clean) + suffix
+        if len(rendered) <= limit:
+            return rendered
+        overflow = len(rendered) - limit
+        clean = clean[: max(0, len(clean) - max(overflow, 24))].rstrip()
+        if clean:
+            clean = clean.rstrip("…") + "…"
+    rendered = prefix + suffix
+    return rendered if len(rendered) <= limit else prefix[: max(0, limit - len(suffix))] + suffix
 
 
 def format_deep_signal(signal: DeepSignal, gemini_text: str) -> str:
     snapshot = signal.snapshot
-    quote = signal.quote
-    price = snapshot.price or quote.price
-    high_values = [bar.high for bar in signal.bars if bar.high is not None]
-    high_52w = snapshot.fifty_two_week_high or (max(high_values) if high_values else None)
-    discount = None
-    if high_52w and price:
-        discount = (price / high_52w - 1.0) * 100.0
-    return (
-        f"<b>Tín hiệu lọc sâu VN100: {html.escape(signal.symbol)}</b>\n"
-        f"{html.escape(snapshot.name)}\n"
-        f"Điểm lọc: <b>{signal.score}/100</b>\n"
-        f"Giá: <b>{format_number(price)}</b> VND\n"
-        f"P/E: {format_number(snapshot.trailing_pe)} | P/B: {format_number(snapshot.price_to_book)}\n"
-        f"Chiết khấu đỉnh 52 tuần: {format_number(discount)}%\n"
-        f"Lý do: {html.escape('; '.join(signal.reasons))}\n\n"
-        f"<b>Gemini phân tích:</b>\n{html.escape(gemini_text)}\n\n"
-        "<i>Tín hiệu nghiên cứu tự động, không phải khuyến nghị mua/bán. Cần tự kiểm tra lại báo cáo tài chính và thanh khoản.</i>"
+    price = snapshot.price or signal.quote.price
+    breakdown = signal.breakdown
+    if breakdown is None:
+        breakdown, _ = build_score_breakdown(
+            snapshot,
+            signal.quote,
+            signal.bars,
+            signal.macro,
+        )
+    plan = signal.trade_plan or build_trade_plan(signal.quote, signal.bars)
+    backtest = signal.backtest or backtest_similar_patterns(signal.bars, plan)
+    macro = signal.macro or MacroContext()
+    macro_score = (
+        format_number(macro.score, 1)
+        if macro.available and macro.score is not None
+        else "—"
+    )
+    if backtest.hit_rate is None:
+        backtest_line = (
+            f"Chưa đủ mẫu kết luận ({backtest.samples} mẫu; "
+            f"{backtest.wins} đạt/{backtest.losses} dừng/{backtest.unresolved} chưa ngã ngũ)."
+        )
+    else:
+        backtest_line = (
+            f"{backtest.hit_rate:.1f}% chạm {backtest.target_label} trước stop "
+            f"({backtest.wins}/{backtest.wins + backtest.losses} mẫu đã ngã ngũ; "
+            f"{backtest.unresolved} chưa ngã ngũ)."
+        )
+    source_line = ""
+    if macro.sources:
+        source = macro.sources[0]
+        source_line = (
+            "\nNguồn vĩ mô: "
+            f'<a href="{html.escape(source.url, quote=True)}">'
+            f"{html.escape(source.title)}</a>"
+        )
+    drivers = list(macro.positive_drivers[:1]) + list(macro.risk_drivers[:2])
+    driver_line = "; ".join(drivers) if drivers else macro.summary
+    reasons = "; ".join(signal.reasons[:7])
+    prefix = (
+        f"<b>DEEP 100 điểm: {html.escape(signal.symbol)}</b>\n"
+        f"{html.escape(snapshot.name)}"
+        f"{' — ' + html.escape(snapshot.sector) if snapshot.sector else ''}\n"
+        f"Tổng: <b>{breakdown.total}/100</b> | "
+        f"DN {breakdown.business}/30 · Định giá {breakdown.valuation}/25 · "
+        f"Kỹ thuật {breakdown.technical}/25 · Rủi ro {breakdown.risk}/10 · "
+        f"Vĩ mô {breakdown.macro}/10\n\n"
+        "<b>1) Doanh nghiệp &amp; định giá</b>\n"
+        f"Giá: <b>{format_number(price)}</b> VND | "
+        f"P/E {format_number(snapshot.trailing_pe)} | P/B {format_number(snapshot.price_to_book)}\n"
+        f"Doanh thu YoY {format_number(snapshot.revenue_growth)}% | "
+        f"LN YoY {format_number(snapshot.net_income_growth)}% | "
+        f"ROE {format_number(snapshot.return_on_equity)}%\n"
+        f"D/E {format_number(snapshot.debt_to_equity)}x | "
+        f"Current ratio {format_number(snapshot.current_ratio)}\n\n"
+        "<b>2) Mẫu hình &amp; kịch bản giá</b>\n"
+        f"Mẫu hình: {html.escape(breakdown.pattern)}\n"
+        f"Vùng theo dõi: {format_number(plan.entry_low)}–{format_number(plan.entry_high)}\n"
+        f"Mốc vô hiệu/stop giả định: {format_number(plan.stop)} "
+        f"(rủi ro {plan.risk_pct:.1f}%)\n"
+        f"T1/T2/T3: {format_number(plan.target_1)} / "
+        f"{format_number(plan.target_2)} / {format_number(plan.target_3)}\n\n"
+        "<b>3) Thống kê mẫu hình lịch sử</b>\n"
+        f"{html.escape(backtest_line)} Khung {backtest.lookahead_sessions} phiên; "
+        "cùng nến chạm cả target và stop được tính là stop.\n\n"
+        "<b>4) Bối cảnh vĩ mô trung lập</b>\n"
+        f"{html.escape(macro.stance)} (điểm vimo-VN {macro_score}) — "
+        f"{html.escape(_plain_excerpt(driver_line, 420))}"
+        f"{source_line}\n\n"
+        f"<b>Điểm cần chú ý:</b> {html.escape(_plain_excerpt(reasons, 520))}\n\n"
+        "<b>Góc nhìn Gemini:</b>\n"
+    )
+    suffix = (
+        "\n\n<i>Điểm số và tỷ lệ trên là thống kê máy từ dữ liệu quá khứ, "
+        "không phải xác suất tương lai hay khuyến nghị mua/bán. Target/stop chỉ là "
+        "kịch bản để đo rủi ro; cần kiểm tra báo cáo tài chính, công bố và thanh khoản.</i>"
+    )
+    gemini_limit = max(240, 3850 - len(prefix) - len(suffix))
+    return _compose_telegram_html(
+        prefix,
+        _plain_excerpt(gemini_text, gemini_limit),
+        suffix,
+    )
+
+
+def format_news_report(
+    topic: str,
+    items: list[NewsItem],
+    macro: MacroContext,
+    analysis: str,
+) -> str:
+    """Render a source-bound, neutral news/macro brief."""
+
+    headline_lines: list[str] = []
+    for index, item in enumerate(items[:DEFAULT_NEWS_MAX_ITEMS], start=1):
+        headline_lines.append(
+            f'{index}. <a href="{html.escape(item.url, quote=True)}">'
+            f"{html.escape(_plain_excerpt(item.title, 170))}</a> "
+            f"— {html.escape(item.source)}"
+        )
+    if not headline_lines:
+        headline_lines.append("Chưa lấy được tiêu đề phù hợp; không suy diễn nội dung.")
+    macro_source = ""
+    if macro.sources:
+        source = macro.sources[0]
+        macro_source = (
+            f'\n<a href="{html.escape(source.url, quote=True)}">'
+            f"Nguồn vĩ mô: {html.escape(source.title)}</a>"
+        )
+    prefix = (
+        f"<b>Phân tích tin trung lập: {html.escape(_plain_excerpt(topic, 120))}</b>\n\n"
+        "<b>Các tiêu đề dùng làm đầu vào</b>\n"
+        + "\n".join(headline_lines)
+        + "\n\n<b>Bối cảnh vimo-VN</b>\n"
+        + f"{html.escape(macro.stance)}"
+        + (f" · điểm {format_number(macro.score, 1)}" if macro.score is not None else "")
+        + f" — {html.escape(_plain_excerpt(macro.summary, 420))}"
+        + macro_source
+        + "\n\n<b>Đánh giá hai chiều</b>\n"
+    )
+    suffix = (
+        "\n\n<i>Bot chỉ đọc metadata tiêu đề và bối cảnh vimo-VN; hãy mở bài/văn bản gốc "
+        "trước khi kết luận. Đây không phải khuyến nghị đầu tư.</i>"
+    )
+    analysis_limit = max(300, 3850 - len(prefix) - len(suffix))
+    return _compose_telegram_html(
+        prefix,
+        _plain_excerpt(analysis, analysis_limit),
+        suffix,
     )
 
 
@@ -1734,6 +2788,7 @@ class DeepSignalScanner:
         provider: YahooQuoteProvider,
         gemini: GeminiAnalyzer,
         symbols: list[str],
+        macro_client: MacroContextClient | None = None,
         min_score: int = 70,
         max_per_scan: int = 2,
         max_workers: int = DEFAULT_SCAN_WORKERS,
@@ -1741,38 +2796,33 @@ class DeepSignalScanner:
         self.provider = provider
         self.gemini = gemini
         self.symbols = symbols
+        self.macro_client = macro_client
         self.min_score = min_score
         self.max_per_scan = max_per_scan
         self.max_workers = max(1, min(int(max_workers), 12))
 
     @staticmethod
-    def _valuation_points(snapshot: FundamentalSnapshot) -> int:
-        points = 0
-        pe = snapshot.trailing_pe
-        pb = snapshot.price_to_book
-        if pe is not None:
-            if 0 < pe <= 10:
-                points += 25
-            elif 10 < pe <= 15:
-                points += 15
-        if pb is not None:
-            if 0 < pb <= 1.2:
-                points += 25
-            elif 1.2 < pb <= 1.8:
-                points += 15
-        return points
+    def _fundamental_ceiling(snapshot: FundamentalSnapshot) -> int:
+        dummy_price = snapshot.price or 1.0
+        dummy_quote = Quote(snapshot.symbol, snapshot.name, dummy_price, dummy_price)
+        baseline, _ = build_score_breakdown(snapshot, dummy_quote, [], None)
+        # Business and valuation are known after the batch request. Assume the
+        # maximum for price/risk/macro so a potentially eligible symbol is
+        # never discarded before its history is loaded.
+        return min(100, baseline.business + baseline.valuation + 25 + 10 + 10)
 
     def _evaluate(
         self,
         symbol: str,
         snapshot: FundamentalSnapshot,
+        macro: MacroContext | None,
     ) -> DeepSignal | None:
         quote = self.provider.get_quote(symbol)
         bars = self.provider.get_history(symbol, range_value="1y", interval="1d")
-        score, reasons = score_candidate(snapshot, quote, bars)
-        if score < self.min_score:
+        signal = build_deep_signal(symbol, snapshot, quote, bars, macro)
+        if signal.score < self.min_score:
             return None
-        return DeepSignal(symbol, score, snapshot, quote, bars, reasons)
+        return signal
 
     def find_candidates(self) -> list[DeepSignal]:
         batch_getter = getattr(self.provider, "get_fundamentals_batch", None)
@@ -1790,18 +2840,19 @@ class DeepSignalScanner:
                 except BotError as exc:
                     LOG.info("Skipping %s fundamentals: %s", symbol, exc)
 
-        # Price/RSI/discount can contribute at most 60 points. Avoid two Yahoo
-        # requests for symbols that cannot mathematically reach the threshold.
+        macro = self.macro_client.latest() if self.macro_client is not None else None
+        # Avoid quote/history requests for symbols that cannot mathematically
+        # reach the threshold even with perfect technical, risk, and macro scores.
         eligible = [
             symbol
             for symbol in self.symbols
             if symbol in snapshots
-            and self._valuation_points(snapshots[symbol]) + 60 >= self.min_score
+            and self._fundamental_ceiling(snapshots[symbol]) >= self.min_score
         ]
         candidates: list[DeepSignal] = []
         with ThreadPoolExecutor(max_workers=min(self.max_workers, len(eligible) or 1)) as executor:
             future_symbols = {
-                executor.submit(self._evaluate, symbol, snapshots[symbol]): symbol
+                executor.submit(self._evaluate, symbol, snapshots[symbol], macro): symbol
                 for symbol in eligible
             }
             for future in as_completed(future_symbols):
@@ -1820,6 +2871,47 @@ class DeepSignalScanner:
 
     def render_signal(self, signal: DeepSignal) -> str:
         return format_deep_signal(signal, self.gemini.analyze(signal))
+
+
+def split_telegram_html(text: str, limit: int = 4090) -> list[str]:
+    """Split only at paragraph/line boundaries so closed HTML tags stay valid."""
+
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    current = ""
+    for paragraph in text.split("\n\n"):
+        candidate = paragraph if not current else current + "\n\n" + paragraph
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        if len(paragraph) <= limit:
+            current = paragraph
+            continue
+        # Normal bot sections are far below the limit. This fallback handles
+        # unexpectedly long plain/escaped model lines without looping forever.
+        for line in paragraph.splitlines() or [paragraph]:
+            if len(line) > limit:
+                if current:
+                    chunks.append(current)
+                    current = ""
+                chunks.extend(
+                    line[index : index + limit]
+                    for index in range(0, len(line), limit)
+                )
+            else:
+                candidate = line if not current else current + "\n" + line
+                if len(candidate) <= limit:
+                    current = candidate
+                else:
+                    chunks.append(current)
+                    current = line
+    if current:
+        chunks.append(current)
+    return [chunk for chunk in chunks if chunk]
 
 
 class TelegramClient:
@@ -1871,15 +2963,16 @@ class TelegramClient:
         return updates if isinstance(updates, list) else []
 
     def send_message(self, chat_id: int | str, text: str) -> None:
-        self._call(
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
-        )
+        for chunk in split_telegram_html(text):
+            self._call(
+                "sendMessage",
+                {
+                    "chat_id": chat_id,
+                    "text": chunk,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                },
+            )
 
 
 WELCOME = (
@@ -1894,7 +2987,9 @@ HELP = (
     "/report <code>FPT</code> — báo cáo nhanh: giá, cao/thấp, khối lượng\n"
     "/chart <code>FPT</code> — biểu đồ chữ 30 phiên\n"
     "/ta <code>FPT</code> — MA5, MA20, RSI14, hỗ trợ/kháng cự\n"
-    "/deep <code>FPT</code> — phân tích sâu P/E, P/B, chiết khấu\n"
+    "/deep <code>FPT</code> — doanh nghiệp, định giá, mẫu hình, điểm 100, target/stop và backtest\n"
+    "/news <code>FPT</code> — phân tích tin doanh nghiệp/chủ đề theo hai chiều, có nguồn\n"
+    "/macro — tin và trạng thái vĩ mô trung lập từ vimo-VN\n"
     "/signals_on — nhận tín hiệu lọc sâu VN100\n"
     "/signals_off — tắt tín hiệu lọc sâu\n"
     "/signals_status — trạng thái nhận tín hiệu\n"
@@ -2010,6 +3105,8 @@ class BotApplication:
         signal_store: SignalStore | None = None,
         scanner: DeepSignalScanner | None = None,
         usage_store: ApiUsageStore | None = None,
+        macro_client: MacroContextClient | None = None,
+        news_service: NeutralNewsService | None = None,
         monthly_signal_limit: int = DEFAULT_MONTHLY_SIGNAL_LIMIT,
         signal_cooldown_days: int = DEFAULT_SIGNAL_COOLDOWN_DAYS,
         research_command_cooldown: float = DEFAULT_RESEARCH_COMMAND_COOLDOWN,
@@ -2020,6 +3117,8 @@ class BotApplication:
         self.signal_store = signal_store
         self.scanner = scanner
         self.usage_store = usage_store
+        self.macro_client = macro_client
+        self.news_service = news_service
         self.monthly_signal_limit = monthly_signal_limit
         self.signal_cooldown_days = signal_cooldown_days
         self.research_command_cooldown = max(0.0, float(research_command_cooldown))
@@ -2042,7 +3141,7 @@ class BotApplication:
     @staticmethod
     def _research_cooldown_message(remaining: int) -> str:
         return (
-            f"Để tránh vượt giới hạn API, /deep và /scan chỉ chạy một lần mỗi phút. "
+            f"Để tránh vượt giới hạn API, /deep, /scan và /news chỉ chạy một lần mỗi phút. "
             f"Hãy thử lại sau {remaining} giây. /ping và /quote vẫn hoạt động bình thường."
         )
 
@@ -2133,15 +3232,55 @@ class BotApplication:
                 if daily_limit:
                     return daily_limit
                 quote = self.provider.get_quote(symbol)
-                bars = self.provider.get_history(symbol, range_value="1y", interval="1d")
+                bars = self.provider.get_history(symbol, range_value="2y", interval="1d")
                 snapshot = self.provider.get_fundamentals(symbol)
-                score, reasons = score_candidate(snapshot, quote, bars)
+                macro = (
+                    self.macro_client.latest()
+                    if self.macro_client is not None
+                    else None
+                )
                 scanner = self.scanner or DeepSignalScanner(
                     self.provider,
                     build_gemini_analyzer(self.usage_store),
                     [symbol],
+                    macro_client=self.macro_client,
                 )
-                return scanner.render_signal(DeepSignal(symbol, score, snapshot, quote, bars, reasons))
+                return scanner.render_signal(
+                    build_deep_signal(symbol, snapshot, quote, bars, macro)
+                )
+            if command in {"/news", "/tintuc", "/macro"}:
+                argument = _argument(text)
+                if command != "/macro" and not argument:
+                    return (
+                        "Dùng: /news <mã hoặc chủ đề>, ví dụ /news FPT "
+                        "hoặc /news Thông tư 14/2026."
+                    )
+                topic = argument or "kinh tế vĩ mô Việt Nam"
+                remaining = self._claim_research_slot()
+                if remaining:
+                    return self._research_cooldown_message(remaining)
+                daily_limit = self._claim_daily_command("news_commands", "/news")
+                if daily_limit:
+                    return daily_limit
+                if self.news_service is None:
+                    return "Nguồn tin RSS chưa được cấu hình."
+                macro = (
+                    self.macro_client.latest()
+                    if self.macro_client is not None
+                    else MacroContext()
+                )
+                try:
+                    items = self.news_service.headlines(topic)
+                except BotError as exc:
+                    LOG.warning("News RSS unavailable: %s", exc)
+                    items = []
+                gemini = (
+                    self.scanner.gemini
+                    if self.scanner is not None
+                    else build_gemini_analyzer(self.usage_store)
+                )
+                analysis = gemini.analyze_news(topic, items, macro)
+                return format_news_report(topic, items, macro, analysis)
             if command == "/signals_on":
                 if not self.signal_store:
                     return "Tính năng tín hiệu chưa được cấu hình."
@@ -2318,6 +3457,9 @@ def build_application() -> BotApplication:
         scan_daily_limit = int(
             os.environ.get("SCAN_DAILY_LIMIT", DEFAULT_SCAN_DAILY_LIMIT)
         )
+        news_daily_limit = int(
+            os.environ.get("NEWS_DAILY_LIMIT", DEFAULT_NEWS_DAILY_LIMIT)
+        )
         vnstock_daily_budget = int(
             os.environ.get("VNSTOCK_DAILY_BUDGET", DEFAULT_VNSTOCK_DAILY_BUDGET)
         )
@@ -2336,6 +3478,15 @@ def build_application() -> BotApplication:
         vnstock_cache_ttl = float(
             os.environ.get("VNSTOCK_CACHE_TTL", DEFAULT_VNSTOCK_CACHE_TTL)
         )
+        vimo_cache_ttl = float(
+            os.environ.get("VIMO_CACHE_TTL", DEFAULT_VIMO_CACHE_TTL)
+        )
+        news_cache_ttl = float(
+            os.environ.get("NEWS_CACHE_TTL", DEFAULT_NEWS_CACHE_TTL)
+        )
+        news_max_items = int(
+            os.environ.get("NEWS_MAX_ITEMS", DEFAULT_NEWS_MAX_ITEMS)
+        )
     except ValueError as exc:
         raise ValueError("Các biến timeout/score/limit phải là số.") from exc
     telegram = TelegramClient(token, timeout=max(10.0, poll_timeout + 10.0))
@@ -2345,6 +3496,7 @@ def build_application() -> BotApplication:
         vnstock_daily_budget=vnstock_daily_budget,
         deep_daily_limit=deep_daily_limit,
         scan_daily_limit=scan_daily_limit,
+        news_daily_limit=news_daily_limit,
     )
     yahoo_provider = YahooQuoteProvider(timeout=max(1.0, yahoo_timeout))
     provider = RoutedMarketDataProvider(
@@ -2361,6 +3513,16 @@ def build_application() -> BotApplication:
         cache_ttl=vnstock_cache_ttl,
     )
     gemini = build_gemini_analyzer(usage_store)
+    macro_client = MacroContextClient(
+        url=os.environ.get("VIMO_LATEST_URL", DEFAULT_VIMO_LATEST_URL),
+        timeout=max(2.0, yahoo_timeout),
+        cache_ttl=vimo_cache_ttl,
+    )
+    news_service = NeutralNewsService(
+        timeout=max(2.0, yahoo_timeout),
+        cache_ttl=news_cache_ttl,
+        max_items=news_max_items,
+    )
     symbols = parse_symbols(os.environ.get("VN100_SYMBOLS"))
     return BotApplication(
         telegram=telegram,
@@ -2368,10 +3530,13 @@ def build_application() -> BotApplication:
         store=WatchlistStore(data_dir / "watchlists.json"),
         signal_store=SignalStore(data_dir / "signal_state.json"),
         usage_store=usage_store,
+        macro_client=macro_client,
+        news_service=news_service,
         scanner=DeepSignalScanner(
             provider=provider,
             gemini=gemini,
             symbols=symbols,
+            macro_client=macro_client,
             min_score=min_signal_score,
             max_per_scan=max_signals_per_scan,
             max_workers=scan_workers,
