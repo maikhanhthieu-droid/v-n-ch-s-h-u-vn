@@ -3266,7 +3266,7 @@ class BotApplication:
                 return scanner.render_signal(
                     build_deep_signal(symbol, snapshot, quote, bars, macro)
                 )
-            if command in {"/news", "/tintuc", "/macro"}:
+            if command in {"/news", "/new", "/tintuc", "/macro"}:
                 argument = _argument(text)
                 if command != "/macro" and not argument:
                     return (

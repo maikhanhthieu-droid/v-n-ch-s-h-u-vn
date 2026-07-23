@@ -690,7 +690,7 @@ class BotTests(unittest.TestCase):
             first = app.handle_text("/news FPT", 1)
             self.assertIn("https://example.com/fpt", first)
             self.assertIn("Đánh giá hai chiều", first)
-            self.assertIn("100%", app.handle_text("/news VNM", 1))
+            self.assertIn("100%", app.handle_text("/new VNM", 1))
             self.assertIn("/news: 1/1", app.handle_text("/usage", 1))
 
     def test_provider_errors_are_user_safe(self):
