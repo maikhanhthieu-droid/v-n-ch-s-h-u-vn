@@ -216,6 +216,7 @@ class MacroContext:
     positive_drivers: tuple[str, ...] = ()
     risk_drivers: tuple[str, ...] = ()
     neutral_drivers: tuple[str, ...] = ()
+    policy_notes: tuple[str, ...] = ()
     generated_at: str = ""
     confidence: str = ""
     sources: tuple[MacroSource, ...] = ()
@@ -487,6 +488,7 @@ class MacroContextClient:
         else:
             cards = []
         sources: list[MacroSource] = []
+        policy_notes: list[str] = []
         seen_urls: set[str] = set()
         for card in cards:
             if not isinstance(card, dict):
@@ -494,6 +496,12 @@ class MacroContextClient:
             key = str(card.get("key") or "").strip().lower()
             if key not in cls.RELEVANT_CARDS:
                 continue
+            if key == "policy_actions_vn":
+                value = str(card.get("value") or "").strip()
+                narrative = str(card.get("narrative") or "").strip()
+                note = " — ".join(part for part in (value, narrative) if part)
+                if note:
+                    policy_notes.append(note[:600])
             url = str(card.get("source_url") or "").strip()
             if not HTTP_URL_RE.match(url) or url in seen_urls:
                 continue
@@ -520,6 +528,7 @@ class MacroContextClient:
             positive_drivers=positive,
             risk_drivers=risks,
             neutral_drivers=neutral,
+            policy_notes=tuple(policy_notes[:3]),
             generated_at=generated_at,
             confidence=confidence,
             sources=tuple(sources),
@@ -1837,7 +1846,8 @@ class GeminiAnalyzer:
             f"Backtest trạng thái tương tự: {backtest}\n"
             f"Vĩ mô vimo-VN: stance={macro.stance}; score={macro.score}; "
             f"summary={macro.summary}; tích cực={macro.positive_drivers}; "
-            f"rủi ro={macro.risk_drivers}; confidence={macro.confidence}\n"
+            f"rủi ro={macro.risk_drivers}; chính sách={macro.policy_notes}; "
+            f"confidence={macro.confidence}\n"
             f"Lý do lọc: {', '.join(signal.reasons)}\n\n"
             "Trả lời tiếng Việt ngắn gọn theo đúng 5 mục, mỗi mục 1–2 câu: "
             "1) Chất lượng doanh nghiệp; 2) Định giá; 3) Mẫu hình và điều kiện xác nhận/hủy; "
@@ -2067,6 +2077,7 @@ class GeminiAnalyzer:
             f"Bối cảnh vimo-VN: stance={macro.stance}; score={macro.score}; "
             f"summary={macro.summary}; tích cực={macro.positive_drivers}; "
             f"rủi ro={macro.risk_drivers}; trung tính={macro.neutral_drivers}; "
+            f"ghi chú chính sách/thông tư={macro.policy_notes}; "
             f"confidence={macro.confidence}\n\n"
             "Trả lời tiếng Việt, tối đa 700 từ, theo 4 mục: "
             "1) Dữ kiện có thể xác nhận từ tiêu đề; 2) Kênh tác động tích cực; "
@@ -2757,6 +2768,12 @@ def format_news_report(
             f'\n<a href="{html.escape(source.url, quote=True)}">'
             f"Nguồn vĩ mô: {html.escape(source.title)}</a>"
         )
+    policy_line = ""
+    if macro.policy_notes:
+        policy_line = (
+            "\nChính sách/thông tư trong vimo-VN: "
+            + html.escape(_plain_excerpt(macro.policy_notes[0], 420))
+        )
     prefix = (
         f"<b>Phân tích tin trung lập: {html.escape(_plain_excerpt(topic, 120))}</b>\n\n"
         "<b>Các tiêu đề dùng làm đầu vào</b>\n"
@@ -2765,6 +2782,7 @@ def format_news_report(
         + f"{html.escape(macro.stance)}"
         + (f" · điểm {format_number(macro.score, 1)}" if macro.score is not None else "")
         + f" — {html.escape(_plain_excerpt(macro.summary, 420))}"
+        + policy_line
         + macro_source
         + "\n\n<b>Đánh giá hai chiều</b>\n"
     )

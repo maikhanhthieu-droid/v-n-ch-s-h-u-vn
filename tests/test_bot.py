@@ -409,7 +409,14 @@ class BotTests(unittest.TestCase):
                     "source_url": "https://example.com/cpi",
                     "as_of": "2026-07",
                     "source_quality": "official",
-                }
+                },
+                {
+                    "key": "policy_actions_vn",
+                    "value": "Thông tư 11-21/2026",
+                    "narrative": "Cần đọc văn bản gốc để xác định phạm vi áp dụng.",
+                    "source_primary": "NHNN",
+                    "source_url": "https://example.com/policy",
+                },
             ],
         }
         client = MacroContextClient(fetcher=lambda url, timeout: payload)
@@ -418,6 +425,7 @@ class BotTests(unittest.TestCase):
         self.assertEqual(context.score, -2)
         self.assertEqual(context.risk_drivers, ("CPI cao",))
         self.assertEqual(context.sources[0].url, "https://example.com/cpi")
+        self.assertIn("Thông tư 11-21/2026", context.policy_notes[0])
 
     def test_rss_parser_and_news_formatter_keep_sources(self):
         rss = """<?xml version="1.0" encoding="UTF-8"?>
