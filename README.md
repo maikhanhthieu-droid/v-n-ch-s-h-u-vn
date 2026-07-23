@@ -140,6 +140,22 @@ chạy `python bot.py`. Không commit `.env` hoặc token vào GitHub. Nếu dù
 Actions, hãy chạy một worker dài hạn bên ngoài Actions; workflow miễn phí không
 phù hợp để giữ long polling liên tục.
 
+### Khởi động một phiên từ GitHub Mobile
+
+Workflow `Start Telegram Bot Session` cho phép mở bot theo yêu cầu trong 15, 30
+hoặc 60 phút. Trong thời gian phiên đang chạy, Telegram gửi lệnh đến runner bằng
+long polling và runner trả kết quả về cuộc trò chuyện.
+
+1. Mở repository trong GitHub Mobile hoặc trình duyệt.
+2. Chọn **Actions → Start Telegram Bot Session → Run workflow**.
+3. Chọn thời gian rồi bấm **Run workflow**.
+4. Chờ job hiện màu vàng/xanh, sau đó gửi `/ping`, `/usage` hoặc `/deep FPT`.
+5. Hết thời gian bot tự dừng. Có thể bấm **Cancel workflow** để dừng sớm.
+
+Chỉ một phiên được phép chạy cùng lúc. Lệnh `/start` trong Telegram không thể tự
+khởi động một runner đã tắt; phải mở phiên GitHub trước. Cách này dành cho phiên
+thử nghiệm theo yêu cầu, không thay thế dịch vụ bot 24/7.
+
 Mỗi lệnh chỉ gọi Gemini tối đa hai lần (model chính và một model dự phòng). Khi
 gặp lỗi quota 429, bot mở circuit breaker và vẫn trả kết quả định lượng thay vì
 tiếp tục retry. Các lệnh `/start`, `/ping`, `/quote` không phụ thuộc Gemini.
