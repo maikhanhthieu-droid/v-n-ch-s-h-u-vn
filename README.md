@@ -199,3 +199,15 @@ TradingView và RSS có thể thiếu/chậm; tiêu đề không thay thế nộ
 Đối với ngân hàng/bảo hiểm, D/E và current ratio không được chấm như doanh nghiệp
 thông thường; bot giữ điểm trung tính và nhắc so sánh theo ngành. Target/stop chỉ
 là kịch bản theo ATR/hỗ trợ gần để chuẩn hóa rủi ro, không phải mức giá bảo đảm.
+
+Phần `/deep` hiển thị riêng kỳ dữ liệu tài chính và thời điểm lấy dữ liệu. Ngoài
+ROE, D/E và current ratio, bot lấy thêm vốn chủ sở hữu, tổng tài sản, tỷ lệ
+VCSH/TTS, nợ vay, tiền và đầu tư ngắn hạn, nợ ròng, CFO/FCF TTM, ROA, biên gộp,
+biên hoạt động, biên ròng và BVPS từ TradingView Vietnam Scanner. Trường thiếu
+được để trống, không nội suy.
+
+Gemini phải đặt P/B cạnh hiệu quả vốn và dòng tiền: P/B thấp không tự động là
+“hấp dẫn”, current ratio cao không đồng nghĩa lượng tiền mặt lớn và D/E thấp
+không đủ để kết luận cấu trúc tài chính “lành mạnh”. Các nhãn chủ quan này bị
+kiểm tra sau khi model trả lời; dữ liệu định lượng gốc vẫn được gửi nếu lớp AI
+không đạt kiểm chứng.

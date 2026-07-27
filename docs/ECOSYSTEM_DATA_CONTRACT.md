@@ -48,6 +48,9 @@ không được dùng thay thế cho nhau.
   được xóa ứng viên; chỉ hard-gate khi người vận hành bật rõ ràng.
 - Bot cổ phiếu đọc vimo-VN; feed quá 72 giờ hoặc thiếu `generated_at` phải về
   macro trung tính.
+- Snapshot doanh nghiệp phải giữ riêng `fundamentals_as_of` (kỳ BCTC),
+  `fundamentals_fetched_at` (lúc lấy) và nguồn. Không gọi dữ liệu quý là dữ liệu
+  thời gian thực; giá thị trường và kỳ báo cáo tài chính không dùng chung ngày.
 - GPT và GLM đánh giá độc lập trên facts mẫu hình. Đồng thuận AI không được
   nâng hạng một mã chưa qua scanner deterministic.
 - Gemini giải thích trạng thái hiện tại. Phản hồi Search không có grounding

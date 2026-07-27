@@ -113,6 +113,40 @@ VN100_SYMBOLS = [
     "VPB", "VPI", "VRE",
 ]
 
+TRADINGVIEW_FUNDAMENTAL_COLUMNS = [
+    "name",
+    "description",
+    "close",
+    "price_earnings_ttm",
+    "price_book_fq",
+    "market_cap_basic",
+    "sector",
+    "industry",
+    "total_revenue",
+    "total_revenue_yoy_growth_ttm",
+    "net_income",
+    "net_income_yoy_growth_ttm",
+    "return_on_equity_fq",
+    "debt_to_equity_fq",
+    "current_ratio_fq",
+    "earnings_per_share_diluted_ttm",
+    "earnings_per_share_diluted_yoy_growth_ttm",
+    # Capital structure, profitability and cash-flow fields. Keep new fields
+    # after the legacy set so older/mocked rows remain backwards compatible.
+    "total_equity_fq",
+    "total_assets_fq",
+    "total_debt_fq",
+    "cash_n_short_term_invest_fq",
+    "cash_f_operating_activities_ttm",
+    "free_cash_flow_ttm",
+    "return_on_assets_fq",
+    "gross_margin_ttm",
+    "operating_margin_ttm",
+    "net_margin_ttm",
+    "book_value_per_share_fq",
+    "fiscal_period_end_fq",
+]
+
 
 class BotError(RuntimeError):
     """A user-safe error returned by an upstream service."""
@@ -196,6 +230,21 @@ class FundamentalSnapshot:
     current_ratio: float | None = None
     earnings_per_share: float | None = None
     earnings_growth: float | None = None
+    total_equity: float | None = None
+    total_assets: float | None = None
+    total_debt: float | None = None
+    cash_and_short_term_investments: float | None = None
+    operating_cash_flow: float | None = None
+    free_cash_flow: float | None = None
+    return_on_assets: float | None = None
+    gross_margin: float | None = None
+    operating_margin: float | None = None
+    net_margin: float | None = None
+    book_value_per_share: float | None = None
+    fundamentals_as_of: str | None = None
+    fundamentals_fetched_at: str | None = None
+    fundamentals_source: str | None = None
+    fundamentals_source_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -385,6 +434,18 @@ def _first_number(*values: Any) -> float | None:
         except (TypeError, ValueError):
             continue
     return None
+
+
+def _iso_date_from_epoch(value: Any) -> str | None:
+    timestamp = _first_number(value)
+    if timestamp is None or not math.isfinite(timestamp) or timestamp <= 0:
+        return None
+    if timestamp > 10_000_000_000:
+        timestamp /= 1000.0
+    try:
+        return datetime.fromtimestamp(timestamp, timezone.utc).date().isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _text_request(url: str, timeout: float, accept: str = "*/*") -> str:
@@ -884,58 +945,83 @@ class YahooQuoteProvider:
                     "tickers": [f"HOSE:{symbol}" for symbol in missing],
                     "query": {"types": []},
                 },
-                "columns": [
-                    "name",
-                    "description",
-                    "close",
-                    "price_earnings_ttm",
-                    "price_book_fq",
-                    "market_cap_basic",
-                    "sector",
-                    "industry",
-                    "total_revenue",
-                    "total_revenue_yoy_growth_ttm",
-                    "net_income",
-                    "net_income_yoy_growth_ttm",
-                    "return_on_equity_fq",
-                    "debt_to_equity_fq",
-                    "current_ratio_fq",
-                    "earnings_per_share_diluted_ttm",
-                    "earnings_per_share_diluted_yoy_growth_ttm",
-                ],
+                "columns": TRADINGVIEW_FUNDAMENTAL_COLUMNS,
             },
             self.timeout,
         )
         rows = payload.get("data")
         if not isinstance(rows, list):
             raise BotError("Nguồn định giá trả về dữ liệu không hợp lệ.")
+        fetched_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         for row in rows:
             if not isinstance(row, dict):
                 continue
             values = row.get("d")
+            fields = (
+                dict(zip(TRADINGVIEW_FUNDAMENTAL_COLUMNS, values))
+                if isinstance(values, list)
+                else {}
+            )
             ticker = str(row.get("s") or "").rsplit(":", 1)[-1].upper()
-            if not ticker and isinstance(values, list) and values:
-                ticker = str(values[0] or "").upper()
+            if not ticker:
+                ticker = str(fields.get("name") or "").upper()
             if ticker not in missing or not isinstance(values, list) or len(values) < 6:
                 continue
             snapshot = FundamentalSnapshot(
                 symbol=ticker,
-                name=str(values[1] or values[0] or ticker),
-                price=_first_number(values[2]),
-                trailing_pe=_first_number(values[3]),
-                price_to_book=_first_number(values[4]),
-                market_cap=_first_number(values[5]),
-                sector=str(values[6]).strip() if len(values) > 6 and values[6] else None,
-                industry=str(values[7]).strip() if len(values) > 7 and values[7] else None,
-                total_revenue=_first_number(values[8]) if len(values) > 8 else None,
-                revenue_growth=_first_number(values[9]) if len(values) > 9 else None,
-                net_income=_first_number(values[10]) if len(values) > 10 else None,
-                net_income_growth=_first_number(values[11]) if len(values) > 11 else None,
-                return_on_equity=_first_number(values[12]) if len(values) > 12 else None,
-                debt_to_equity=_first_number(values[13]) if len(values) > 13 else None,
-                current_ratio=_first_number(values[14]) if len(values) > 14 else None,
-                earnings_per_share=_first_number(values[15]) if len(values) > 15 else None,
-                earnings_growth=_first_number(values[16]) if len(values) > 16 else None,
+                name=str(fields.get("description") or fields.get("name") or ticker),
+                price=_first_number(fields.get("close")),
+                trailing_pe=_first_number(fields.get("price_earnings_ttm")),
+                price_to_book=_first_number(fields.get("price_book_fq")),
+                market_cap=_first_number(fields.get("market_cap_basic")),
+                sector=(
+                    str(fields["sector"]).strip() if fields.get("sector") else None
+                ),
+                industry=(
+                    str(fields["industry"]).strip() if fields.get("industry") else None
+                ),
+                total_revenue=_first_number(fields.get("total_revenue")),
+                revenue_growth=_first_number(
+                    fields.get("total_revenue_yoy_growth_ttm")
+                ),
+                net_income=_first_number(fields.get("net_income")),
+                net_income_growth=_first_number(
+                    fields.get("net_income_yoy_growth_ttm")
+                ),
+                return_on_equity=_first_number(fields.get("return_on_equity_fq")),
+                debt_to_equity=_first_number(fields.get("debt_to_equity_fq")),
+                current_ratio=_first_number(fields.get("current_ratio_fq")),
+                earnings_per_share=_first_number(
+                    fields.get("earnings_per_share_diluted_ttm")
+                ),
+                earnings_growth=_first_number(
+                    fields.get("earnings_per_share_diluted_yoy_growth_ttm")
+                ),
+                total_equity=_first_number(fields.get("total_equity_fq")),
+                total_assets=_first_number(fields.get("total_assets_fq")),
+                total_debt=_first_number(fields.get("total_debt_fq")),
+                cash_and_short_term_investments=_first_number(
+                    fields.get("cash_n_short_term_invest_fq")
+                ),
+                operating_cash_flow=_first_number(
+                    fields.get("cash_f_operating_activities_ttm")
+                ),
+                free_cash_flow=_first_number(fields.get("free_cash_flow_ttm")),
+                return_on_assets=_first_number(fields.get("return_on_assets_fq")),
+                gross_margin=_first_number(fields.get("gross_margin_ttm")),
+                operating_margin=_first_number(fields.get("operating_margin_ttm")),
+                net_margin=_first_number(fields.get("net_margin_ttm")),
+                book_value_per_share=_first_number(
+                    fields.get("book_value_per_share_fq")
+                ),
+                fundamentals_as_of=_iso_date_from_epoch(
+                    fields.get("fiscal_period_end_fq")
+                ),
+                fundamentals_fetched_at=fetched_at,
+                fundamentals_source="TradingView Vietnam Scanner",
+                fundamentals_source_url=(
+                    f"https://www.tradingview.com/symbols/HOSE-{ticker}/financials-overview/"
+                ),
             )
             snapshots[ticker] = snapshot
             self._fundamental_cache[ticker] = (now, snapshot)
@@ -1296,6 +1382,89 @@ def format_number(value: float | None, decimals: int = 2) -> str:
     if value is None:
         return "—"
     return f"{value:,.{decimals}f}"
+
+
+def format_vnd_billions(value: float | None) -> str:
+    if value is None:
+        return "—"
+    return f"{value / 1_000_000_000:,.2f} tỷ"
+
+
+def _capital_metrics(snapshot: FundamentalSnapshot) -> dict[str, float | None]:
+    equity_ratio = (
+        snapshot.total_equity / snapshot.total_assets * 100
+        if snapshot.total_equity is not None
+        and snapshot.total_assets is not None
+        and snapshot.total_assets > 0
+        else None
+    )
+    net_debt = (
+        snapshot.total_debt - snapshot.cash_and_short_term_investments
+        if snapshot.total_debt is not None
+        and snapshot.cash_and_short_term_investments is not None
+        else None
+    )
+    return {
+        "equity_ratio": equity_ratio,
+        "net_debt": net_debt,
+    }
+
+
+def _has_extended_fundamentals(snapshot: FundamentalSnapshot) -> bool:
+    return any(
+        value is not None
+        for value in (
+            snapshot.total_equity,
+            snapshot.total_assets,
+            snapshot.total_debt,
+            snapshot.cash_and_short_term_investments,
+            snapshot.operating_cash_flow,
+            snapshot.free_cash_flow,
+            snapshot.return_on_assets,
+            snapshot.gross_margin,
+            snapshot.operating_margin,
+            snapshot.net_margin,
+            snapshot.book_value_per_share,
+            snapshot.fundamentals_as_of,
+        )
+    )
+
+
+def _capital_snapshot_html(snapshot: FundamentalSnapshot) -> str:
+    if not _has_extended_fundamentals(snapshot):
+        return ""
+    metrics = _capital_metrics(snapshot)
+    source = html.escape(snapshot.fundamentals_source or "TradingView Vietnam Scanner")
+    if snapshot.fundamentals_source_url:
+        source = (
+            f'<a href="{html.escape(snapshot.fundamentals_source_url, quote=True)}">'
+            f"{source}</a>"
+        )
+    as_of = html.escape(snapshot.fundamentals_as_of or "chưa rõ kỳ BCTC")
+    fetched = (
+        f" · lấy {html.escape(snapshot.fundamentals_fetched_at)}"
+        if snapshot.fundamentals_fetched_at
+        else ""
+    )
+    return (
+        "<b>Vốn chủ, hiệu quả vốn &amp; dòng tiền</b>\n"
+        f"Kỳ dữ liệu tài chính: {as_of}{fetched} · Nguồn: {source}\n"
+        f"VCSH {format_vnd_billions(snapshot.total_equity)} VND | "
+        f"Tổng tài sản {format_vnd_billions(snapshot.total_assets)} VND | "
+        f"VCSH/TTS {format_number(metrics['equity_ratio'])}%\n"
+        f"Nợ vay {format_vnd_billions(snapshot.total_debt)} VND | "
+        f"Tiền &amp; ĐT ngắn hạn "
+        f"{format_vnd_billions(snapshot.cash_and_short_term_investments)} VND | "
+        f"Nợ ròng {format_vnd_billions(metrics['net_debt'])} VND\n"
+        f"CFO/FCF TTM: {format_vnd_billions(snapshot.operating_cash_flow)} / "
+        f"{format_vnd_billions(snapshot.free_cash_flow)} VND\n"
+        f"ROE/ROA {format_number(snapshot.return_on_equity)}% / "
+        f"{format_number(snapshot.return_on_assets)}% | "
+        f"Biên gộp/HĐ/ròng {format_number(snapshot.gross_margin)}% / "
+        f"{format_number(snapshot.operating_margin)}% / "
+        f"{format_number(snapshot.net_margin)}%\n"
+        f"BVPS {format_number(snapshot.book_value_per_share)} VND\n\n"
+    )
 
 
 def format_quote(quote: Quote) -> str:
@@ -1912,6 +2081,11 @@ class GeminiAnalyzer:
         backtest = signal.backtest
         backtest_3m = signal.backtest_3m
         macro = signal.macro or MacroContext()
+        capital = _capital_metrics(snapshot)
+
+        def prompt_billion(value: float | None) -> str:
+            return "chưa có" if value is None else f"{value / 1_000_000_000:.2f} tỷ VND"
+
         web_instruction = (
             "Hãy dùng Google Search để kiểm tra thông tin mới nhất từ nguồn sơ cấp/đáng tin "
             "(công bố doanh nghiệp, HOSE/HNX/SSC, báo cáo tài chính hoặc báo chí tài chính uy tín). "
@@ -1928,7 +2102,10 @@ class GeminiAnalyzer:
             f"{web_instruction} "
             "Điểm 100, target/stop và backtest là kết quả cố định của hệ thống: chỉ được giải "
             "thích, không được thay đổi. Không gọi hit-rate là xác suất tương lai, không khẳng "
-            "định lợi nhuận và không ra lệnh mua/bán.\n\n"
+            "định lợi nhuận và không ra lệnh mua/bán. Đánh giá phải trung lập: P/B thấp không "
+            "tự động là hấp dẫn; current ratio cao không đồng nghĩa tiền mặt dồi dào; D/E thấp "
+            "không đủ để gọi cấu trúc tài chính lành mạnh. Phải đối chiếu ROE/ROA, tỷ lệ vốn "
+            "chủ, nợ ròng và CFO/FCF; nếu thiếu chuẩn ngành thì nói chưa có cơ sở so sánh.\n\n"
             f"Ngày phân tích: {datetime.now().strftime('%Y-%m-%d')}\n"
             f"Mã: {signal.symbol}\n"
             f"Tên: {snapshot.name}\n"
@@ -1937,8 +2114,24 @@ class GeminiAnalyzer:
             f"Doanh thu YoY: {snapshot.revenue_growth}%\n"
             f"Lợi nhuận YoY: {snapshot.net_income_growth}%\n"
             f"ROE: {snapshot.return_on_equity}%\n"
+            f"ROA: {snapshot.return_on_assets}%\n"
             f"D/E: {snapshot.debt_to_equity}x\n"
             f"Current ratio: {snapshot.current_ratio}\n"
+            f"Kỳ BCTC nguồn: {snapshot.fundamentals_as_of or 'chưa rõ'}\n"
+            f"Thời điểm lấy dữ liệu: {snapshot.fundamentals_fetched_at or 'chưa rõ'}\n"
+            f"Nguồn dữ liệu doanh nghiệp: {snapshot.fundamentals_source or 'chưa rõ'}\n"
+            f"Vốn chủ sở hữu: {prompt_billion(snapshot.total_equity)}\n"
+            f"Tổng tài sản: {prompt_billion(snapshot.total_assets)}\n"
+            f"Tỷ lệ vốn chủ/TTS: {capital['equity_ratio']}%\n"
+            f"Nợ vay: {prompt_billion(snapshot.total_debt)}\n"
+            f"Tiền và đầu tư ngắn hạn: "
+            f"{prompt_billion(snapshot.cash_and_short_term_investments)}\n"
+            f"Nợ ròng: {prompt_billion(capital['net_debt'])}\n"
+            f"CFO TTM: {prompt_billion(snapshot.operating_cash_flow)}\n"
+            f"FCF TTM: {prompt_billion(snapshot.free_cash_flow)}\n"
+            f"Biên gộp/HĐ/ròng: {snapshot.gross_margin}% / "
+            f"{snapshot.operating_margin}% / {snapshot.net_margin}%\n"
+            f"BVPS: {snapshot.book_value_per_share} VND\n"
             f"P/E: {snapshot.trailing_pe}\n"
             f"P/B: {snapshot.price_to_book}\n"
             f"MA20: {moving_average(closes, 20)}\n"
@@ -2035,10 +2228,35 @@ class GeminiAnalyzer:
         """Reject any number that did not exist in deterministic input."""
         allowed = cls._numeric_tokens(prompt)
         for claim in cls._numeric_tokens(text):
-            if not any(math.isclose(claim, value, rel_tol=1e-9, abs_tol=1e-9) for value in allowed):
+            if not any(
+                math.isclose(claim, value, rel_tol=1e-9, abs_tol=1e-9)
+                or any(
+                    math.isclose(claim, round(value, decimals), abs_tol=1e-9)
+                    for decimals in (0, 1, 2, 3)
+                )
+                for value in allowed
+            ):
                 raise RuntimeError(
                     "Gemini added a numeric claim not present in deterministic input"
                 )
+
+    @staticmethod
+    def _validate_neutral_language(text: str) -> None:
+        normalized = re.sub(r"\s+", " ", text.casefold())
+        banned = (
+            "p/b hấp dẫn",
+            "định giá hấp dẫn",
+            "cấu trúc tài chính lành mạnh",
+            "tài chính lành mạnh",
+            "thanh khoản dồi dào",
+            "cổ phiếu tốt",
+            "cổ phiếu xấu",
+        )
+        found = [phrase for phrase in banned if phrase in normalized]
+        if found:
+            raise RuntimeError(
+                "Gemini used a non-neutral unsupported label: " + ", ".join(found)
+            )
 
     def _analyze_interactions(
         self,
@@ -2068,6 +2286,7 @@ class GeminiAnalyzer:
         if use_search and not sources:
             raise RuntimeError("Gemini Search returned no grounding sources")
         self._validate_numeric_claims(text, prompt)
+        self._validate_neutral_language(text)
         return self._with_sources(text, sources)
 
     def _analyze_legacy_fallback(self, prompt: str) -> str:
@@ -2100,6 +2319,7 @@ class GeminiAnalyzer:
         if not text:
             raise RuntimeError("Gemini fallback không trả về nội dung")
         self._validate_numeric_claims(text, prompt)
+        self._validate_neutral_language(text)
         return self._with_sources(text[:2200], [])
 
     def analyze(self, signal: DeepSignal) -> str:
@@ -2443,6 +2663,14 @@ def build_score_breakdown(
         revenue_points + profit_points + roe_points + balance_points,
         30,
     )
+    if snapshot.operating_cash_flow is not None and snapshot.operating_cash_flow < 0:
+        reasons.append(
+            f"CFO TTM âm {format_vnd_billions(snapshot.operating_cash_flow)} VND"
+        )
+    if snapshot.free_cash_flow is not None and snapshot.free_cash_flow < 0:
+        reasons.append(
+            f"FCF TTM âm {format_vnd_billions(snapshot.free_cash_flow)} VND"
+        )
 
     # 2) Valuation: 25 points.
     pe = snapshot.trailing_pe
@@ -2899,6 +3127,7 @@ def format_deep_signal(signal: DeepSignal, gemini_text: str) -> str:
     drivers = list(macro.positive_drivers[:1]) + list(macro.risk_drivers[:2])
     driver_line = "; ".join(drivers) if drivers else macro.summary
     reasons = "; ".join(signal.reasons[:7])
+    capital_html = _capital_snapshot_html(snapshot)
     prefix = (
         f"<b>DEEP 100 điểm: {html.escape(signal.symbol)}</b>\n"
         f"{html.escape(snapshot.name)}"
@@ -2915,6 +3144,7 @@ def format_deep_signal(signal: DeepSignal, gemini_text: str) -> str:
         f"ROE {format_number(snapshot.return_on_equity)}%\n"
         f"D/E {format_number(snapshot.debt_to_equity)}x | "
         f"Current ratio {format_number(snapshot.current_ratio)}\n\n"
+        f"{capital_html}"
         "<b>2) Mẫu hình &amp; kịch bản giá</b>\n"
         f"Mẫu hình: {html.escape(breakdown.pattern)}\n"
         f"Vùng theo dõi: {format_number(plan.entry_low)}–{format_number(plan.entry_high)}\n"

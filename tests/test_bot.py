@@ -372,6 +372,8 @@ class BotTests(unittest.TestCase):
                         "FPT", "FPT Corp", 67000, 11.8, 2.9, 1000,
                         "Technology Services", "IT Services", 5000, 18.2,
                         900, 21.5, 24.0, 0.35, 1.7, 5400, 20.2,
+                        2000, 3000, 700, 500, 400, 250, 12.0,
+                        50.0, 20.0, 15.0, 5000, 1774915200,
                     ],
                 },
                 {
@@ -392,6 +394,17 @@ class BotTests(unittest.TestCase):
         self.assertAlmostEqual(snapshots["HPG"].price_to_book, 1.3)
         self.assertEqual(snapshots["FPT"].sector, "Technology Services")
         self.assertAlmostEqual(snapshots["FPT"].return_on_equity, 24.0)
+        self.assertEqual(snapshots["FPT"].total_equity, 2000)
+        self.assertEqual(snapshots["FPT"].free_cash_flow, 250)
+        self.assertEqual(snapshots["FPT"].return_on_assets, 12.0)
+        self.assertEqual(snapshots["FPT"].fundamentals_as_of, "2026-03-31")
+        self.assertEqual(
+            snapshots["FPT"].fundamentals_source,
+            "TradingView Vietnam Scanner",
+        )
+        columns = post.call_args.args[1]["columns"]
+        self.assertIn("total_equity_fq", columns)
+        self.assertIn("cash_f_operating_activities_ttm", columns)
 
     def test_macro_context_parses_vimo_sources_and_drivers(self):
         payload = {
@@ -453,6 +466,69 @@ class BotTests(unittest.TestCase):
                 "Mục tiêu tăng 30 phần trăm.",
                 "Dữ liệu đầu vào chỉ có giá 20.",
             )
+
+    def test_gemini_accepts_rounded_input_but_rejects_non_neutral_labels(self):
+        analyzer = GeminiAnalyzer("")
+        analyzer._validate_numeric_claims("ROE 1.53%.", "ROE: 1.52691842223751%.")
+        with self.assertRaisesRegex(RuntimeError, "non-neutral"):
+            analyzer._validate_neutral_language(
+                "P/B hấp dẫn và cấu trúc tài chính lành mạnh."
+            )
+
+    def test_extended_capital_data_is_visible_and_grounded_in_prompt(self):
+        bars = [
+            PriceBar(
+                close=10_000 + index,
+                high=10_050 + index,
+                low=9_950 + index,
+                volume=500_000,
+            )
+            for index in range(220)
+        ]
+        quote = Quote("GIL", "GIL", bars[-1].close, bars[-2].close)
+        snapshot = FundamentalSnapshot(
+            symbol="GIL",
+            name="GIL",
+            price=quote.price,
+            trailing_pe=17.98,
+            price_to_book=0.27,
+            revenue_growth=27.55,
+            net_income_growth=51.21,
+            return_on_equity=1.52691842223751,
+            debt_to_equity=0.403605267416026,
+            current_ratio=6.33064507845548,
+            total_equity=2_660_209_693_199,
+            total_assets=3_825_688_919_992,
+            total_debt=1_006_682_121_521,
+            cash_and_short_term_investments=661_916_446_695,
+            operating_cash_flow=-656_689_980_892,
+            free_cash_flow=-707_362_937_390,
+            return_on_assets=1.03778722545824,
+            gross_margin=21.1958172129866,
+            operating_margin=6.35847269352053,
+            net_margin=4.82143103321747,
+            book_value_per_share=25_258.30126,
+            fundamentals_as_of="2026-03-31",
+            fundamentals_fetched_at="2026-07-27T08:00:00+00:00",
+            fundamentals_source="TradingView Vietnam Scanner",
+            fundamentals_source_url=(
+                "https://www.tradingview.com/symbols/HOSE-GIL/financials-overview/"
+            ),
+        )
+        signal = build_deep_signal("GIL", snapshot, quote, bars, MacroContext())
+        analyzer = GeminiAnalyzer("")
+        prompt = analyzer._build_prompt(signal, allow_search=False)
+        rendered = format_deep_signal(signal, "Phân tích trung lập.")
+
+        self.assertIn("Vốn chủ sở hữu: 2660.21 tỷ VND", prompt)
+        self.assertIn("CFO TTM: -656.69 tỷ VND", prompt)
+        self.assertIn("P/B thấp không tự động là hấp dẫn", prompt)
+        self.assertIn("Kỳ BCTC nguồn: 2026-03-31", prompt)
+        self.assertIn("Vốn chủ, hiệu quả vốn &amp; dòng tiền", rendered)
+        self.assertIn("VCSH 2,660.21 tỷ VND", rendered)
+        self.assertIn("CFO/FCF TTM: -656.69 tỷ / -707.36 tỷ VND", rendered)
+        self.assertIn("Kỳ dữ liệu tài chính: 2026-03-31", rendered)
+        self.assertTrue(any("CFO TTM âm" in reason for reason in signal.reasons))
 
     def test_rss_parser_and_news_formatter_keep_sources(self):
         rss = """<?xml version="1.0" encoding="UTF-8"?>
