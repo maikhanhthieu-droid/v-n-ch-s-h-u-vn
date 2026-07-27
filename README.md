@@ -139,6 +139,7 @@ Biến cấu hình:
 - `NEWS_DAILY_LIMIT`: tối đa `8` lệnh `/news` hoặc `/macro` mỗi ngày
 - `VIMO_LATEST_URL`: mặc định đọc `vimo-VN/output/latest.json`
 - `VIMO_CACHE_TTL`: cache vĩ mô `900` giây
+- `VIMO_MAX_AGE_HOURS`: quá `72` giờ thì vimo-VN bị coi là stale và lớp vĩ mô tự về trung tính
 - `NEWS_CACHE_TTL`: cache tiêu đề theo chủ đề `900` giây
 - `NEWS_MAX_ITEMS`: tối đa `5` tiêu đề có nguồn mỗi lần
 - `SCAN_WEEKDAYS`: ngày quét, định dạng số thứ trong tuần của Python; mặc định `0,3` là thứ Hai và thứ Năm
@@ -151,6 +152,13 @@ Biến cấu hình:
 - `VN100_SYMBOLS`: danh sách mã override, phân tách bằng dấu phẩy nếu rổ VN100 thay đổi
 
 Tín hiệu này là bộ lọc nghiên cứu tự động, không phải khuyến nghị mua/bán.
+
+Gemini chỉ là lớp diễn giải. Khi bật Search mà phản hồi không có nguồn grounding,
+hoặc phản hồi chứa số không có trong dữ liệu deterministic đầu vào, nội dung đó
+bị loại; bot vẫn tiếp tục với kết quả chấm điểm gốc.
+
+Kiến trúc chia sẻ dữ liệu giữa các repository được mô tả tại
+[`docs/ECOSYSTEM_DATA_CONTRACT.md`](docs/ECOSYSTEM_DATA_CONTRACT.md).
 
 ## Kiểm thử
 

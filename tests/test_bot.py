@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -394,7 +395,7 @@ class BotTests(unittest.TestCase):
 
     def test_macro_context_parses_vimo_sources_and_drivers(self):
         payload = {
-            "generated_at_bkk": "2026-07-23 08:00",
+            "generated_at_bkk": "2026-07-23T08:00:00+07:00",
             "macro_strategy": {
                 "stance": "NẮM GIỮ / CHỜ XÁC NHẬN",
                 "score": -2,
@@ -420,13 +421,38 @@ class BotTests(unittest.TestCase):
                 },
             ],
         }
-        client = MacroContextClient(fetcher=lambda url, timeout: payload)
+        client = MacroContextClient(
+            fetcher=lambda url, timeout: payload,
+            now_factory=lambda: datetime(2026, 7, 23, 9, 0, tzinfo=timezone.utc),
+        )
         context = client.latest()
         self.assertTrue(context.available)
         self.assertEqual(context.score, -2)
         self.assertEqual(context.risk_drivers, ("CPI cao",))
         self.assertEqual(context.sources[0].url, "https://example.com/cpi")
         self.assertIn("Thông tư 11-21/2026", context.policy_notes[0])
+
+    def test_macro_context_rejects_stale_vimo_payload(self):
+        payload = {
+            "generated_at_bkk": "2026-07-20T08:00:00+07:00",
+            "macro_strategy": {"stance": "TÍCH CỰC", "score": 4},
+            "cards": [],
+        }
+        context = MacroContextClient.parse(
+            payload,
+            max_age_hours=72,
+            now=datetime(2026, 7, 27, 8, 0, tzinfo=timezone.utc),
+        )
+        self.assertFalse(context.available)
+        self.assertIn("quá hạn", context.summary)
+
+    def test_gemini_rejects_new_numeric_claim_not_in_prompt(self):
+        analyzer = GeminiAnalyzer("")
+        with self.assertRaisesRegex(RuntimeError, "numeric claim"):
+            analyzer._validate_numeric_claims(
+                "Mục tiêu tăng 30 phần trăm.",
+                "Dữ liệu đầu vào chỉ có giá 20.",
+            )
 
     def test_rss_parser_and_news_formatter_keep_sources(self):
         rss = """<?xml version="1.0" encoding="UTF-8"?>

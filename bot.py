@@ -48,7 +48,7 @@ import unicodedata
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.error import HTTPError, URLError
@@ -96,6 +96,7 @@ DEFAULT_VIMO_LATEST_URL = (
     "vimo-VN/main/output/latest.json"
 )
 DEFAULT_VIMO_CACHE_TTL = 900.0
+DEFAULT_VIMO_MAX_AGE_HOURS = 72.0
 DEFAULT_NEWS_CACHE_TTL = 900.0
 DEFAULT_NEWS_MAX_ITEMS = 5
 
@@ -222,6 +223,7 @@ class MacroContext:
     confidence: str = ""
     sources: tuple[MacroSource, ...] = ()
     available: bool = False
+    age_hours: float | None = None
 
 
 @dataclass(frozen=True)
@@ -465,12 +467,16 @@ class MacroContextClient:
         url: str = DEFAULT_VIMO_LATEST_URL,
         timeout: float = DEFAULT_YAHOO_TIMEOUT,
         cache_ttl: float = DEFAULT_VIMO_CACHE_TTL,
+        max_age_hours: float = DEFAULT_VIMO_MAX_AGE_HOURS,
         fetcher: Callable[[str, float], dict[str, Any]] | None = None,
+        now_factory: Callable[[], datetime] | None = None,
     ):
         self.url = url.strip() or DEFAULT_VIMO_LATEST_URL
         self.timeout = max(2.0, float(timeout))
         self.cache_ttl = max(0.0, float(cache_ttl))
+        self.max_age_hours = max(1.0, float(max_age_hours))
         self.fetcher = fetcher or _json_request
+        self.now_factory = now_factory or (lambda: datetime.now(timezone.utc))
         self._cache: tuple[float, MacroContext] | None = None
         self._lock = threading.Lock()
 
@@ -479,7 +485,13 @@ class MacroContextClient:
         return MacroContext(summary=summary, available=False)
 
     @classmethod
-    def parse(cls, payload: dict[str, Any]) -> MacroContext:
+    def parse(
+        cls,
+        payload: dict[str, Any],
+        *,
+        max_age_hours: float = DEFAULT_VIMO_MAX_AGE_HOURS,
+        now: datetime | None = None,
+    ) -> MacroContext:
         strategy = payload.get("macro_strategy")
         if not isinstance(strategy, dict):
             return cls._unavailable("vimo-VN chưa xuất bản phần macro_strategy.")
@@ -500,6 +512,36 @@ class MacroContextClient:
             or payload.get("generated_at")
             or ""
         ).strip()
+        if not generated_at:
+            return cls._unavailable(
+                "vimo-VN thiếu generated_at; điểm vĩ mô được giữ ở mức trung tính."
+            )
+        try:
+            generated = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+            if generated.tzinfo is None:
+                generated = generated.replace(tzinfo=timezone.utc)
+            reference_now = now or datetime.now(timezone.utc)
+            if reference_now.tzinfo is None:
+                reference_now = reference_now.replace(tzinfo=timezone.utc)
+            age_hours = max(
+                0.0,
+                (reference_now.astimezone(timezone.utc) - generated.astimezone(timezone.utc)).total_seconds()
+                / 3600,
+            )
+        except ValueError:
+            return cls._unavailable(
+                "vimo-VN có generated_at không hợp lệ; điểm vĩ mô được giữ ở mức trung tính."
+            )
+        if age_hours > max_age_hours:
+            return MacroContext(
+                summary=(
+                    f"vimo-VN đã quá hạn ({age_hours:.1f} giờ); "
+                    "điểm vĩ mô được giữ ở mức trung tính."
+                ),
+                generated_at=generated_at,
+                available=False,
+                age_hours=round(age_hours, 2),
+            )
 
         cards_raw = payload.get("cards")
         if isinstance(cards_raw, dict):
@@ -554,6 +596,7 @@ class MacroContextClient:
             confidence=confidence,
             sources=tuple(sources),
             available=True,
+            age_hours=round(age_hours, 2),
         )
 
     def latest(self) -> MacroContext:
@@ -562,7 +605,11 @@ class MacroContextClient:
             if self._cache and self._cache[0] > now:
                 return self._cache[1]
         try:
-            context = self.parse(self.fetcher(self.url, self.timeout))
+            context = self.parse(
+                self.fetcher(self.url, self.timeout),
+                max_age_hours=self.max_age_hours,
+                now=self.now_factory(),
+            )
         except (BotError, TypeError, ValueError) as exc:
             LOG.warning("Cannot load vimo-VN macro context: %s", type(exc).__name__)
             context = self._unavailable(
@@ -1960,12 +2007,38 @@ class GeminiAnalyzer:
     @staticmethod
     def _with_sources(text: str, sources: list[tuple[str, str]]) -> str:
         clean_text = text.strip()[:2200]
+        label = (
+            "\n\n(Nhận xét AI; không được dùng để thay thế số liệu và "
+            "kết quả chấm điểm deterministic.)"
+        )
         if not sources:
-            return clean_text
+            return (clean_text + label)[:2600]
         source_lines = ["Nguồn kiểm chứng:"]
         for title, url in sources:
             source_lines.append(f"• {title}: {url}")
-        return (clean_text + "\n\n" + "\n".join(source_lines))[:3200]
+        return (
+            clean_text + "\n\n" + "\n".join(source_lines) + label
+        )[:3200]
+
+    @staticmethod
+    def _numeric_tokens(text: str) -> list[float]:
+        values: list[float] = []
+        for raw in re.findall(r"(?<![\w.])-?\d+(?:[.,]\d+)?", text):
+            try:
+                values.append(float(raw.replace(",", ".")))
+            except ValueError:
+                continue
+        return values
+
+    @classmethod
+    def _validate_numeric_claims(cls, text: str, prompt: str) -> None:
+        """Reject any number that did not exist in deterministic input."""
+        allowed = cls._numeric_tokens(prompt)
+        for claim in cls._numeric_tokens(text):
+            if not any(math.isclose(claim, value, rel_tol=1e-9, abs_tol=1e-9) for value in allowed):
+                raise RuntimeError(
+                    "Gemini added a numeric claim not present in deterministic input"
+                )
 
     def _analyze_interactions(
         self,
@@ -1992,6 +2065,9 @@ class GeminiAnalyzer:
         text, sources = self._extract_interaction(interaction)
         if not text:
             raise RuntimeError("Gemini không trả về nội dung")
+        if use_search and not sources:
+            raise RuntimeError("Gemini Search returned no grounding sources")
+        self._validate_numeric_claims(text, prompt)
         return self._with_sources(text, sources)
 
     def _analyze_legacy_fallback(self, prompt: str) -> str:
@@ -2023,7 +2099,8 @@ class GeminiAnalyzer:
         text = "\n".join(str(part.get("text", "")).strip() for part in parts).strip()
         if not text:
             raise RuntimeError("Gemini fallback không trả về nội dung")
-        return text[:2200]
+        self._validate_numeric_claims(text, prompt)
+        return self._with_sources(text[:2200], [])
 
     def analyze(self, signal: DeepSignal) -> str:
         if not self.enabled():
@@ -3650,6 +3727,9 @@ def build_application() -> BotApplication:
         vimo_cache_ttl = float(
             os.environ.get("VIMO_CACHE_TTL", DEFAULT_VIMO_CACHE_TTL)
         )
+        vimo_max_age_hours = float(
+            os.environ.get("VIMO_MAX_AGE_HOURS", DEFAULT_VIMO_MAX_AGE_HOURS)
+        )
         news_cache_ttl = float(
             os.environ.get("NEWS_CACHE_TTL", DEFAULT_NEWS_CACHE_TTL)
         )
@@ -3686,6 +3766,7 @@ def build_application() -> BotApplication:
         url=os.environ.get("VIMO_LATEST_URL", DEFAULT_VIMO_LATEST_URL),
         timeout=max(2.0, yahoo_timeout),
         cache_ttl=vimo_cache_ttl,
+        max_age_hours=vimo_max_age_hours,
     )
     news_service = NeutralNewsService(
         timeout=max(2.0, yahoo_timeout),
