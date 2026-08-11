@@ -354,6 +354,10 @@ class CouncilConfig:
     glm_model: str = DEFAULT_GLM_MODEL
     deepseek_base_url: str = DEFAULT_DEEPSEEK_BASE_URL
     deepseek_model: str = DEFAULT_DEEPSEEK_MODEL
+    siliconflow_api_key: str = field(default="", repr=False, compare=False)
+    siliconflow_base_url: str = DEFAULT_SILICONFLOW_BASE_URL
+    siliconflow_glm_model: str = ""
+    siliconflow_deepseek_model: str = ""
     request_timeout_seconds: float = 20.0
     overall_timeout_seconds: float = 22.0
     max_output_tokens: int = 800
@@ -421,8 +425,13 @@ class CouncilConfig:
         free_first = _parse_bool(env.get("MODEL_COUNCIL_FREE_FIRST"), True)
         openrouter_key = env.get("OPENROUTER_API_KEY", "").strip()
         siliconflow_key = env.get("SILICONFLOW_API_KEY", "").strip()
-        siliconflow_glm_model = env.get("SILICONFLOW_GLM_MODEL", "").strip()
-        siliconflow_deepseek_model = env.get("SILICONFLOW_DEEPSEEK_MODEL", "").strip()
+        siliconflow_free_model = env.get("SILICONFLOW_FREE_MODEL", "").strip()
+        siliconflow_glm_model = env.get(
+            "SILICONFLOW_GLM_MODEL", siliconflow_free_model
+        ).strip()
+        siliconflow_deepseek_model = env.get(
+            "SILICONFLOW_DEEPSEEK_MODEL", siliconflow_free_model
+        ).strip()
 
         glm_key = env.get("GLM_API_KEY", "")
         glm_base_url = env.get("GLM_BASE_URL", DEFAULT_GLM_BASE_URL)
@@ -457,6 +466,14 @@ class CouncilConfig:
             glm_model=glm_model,
             deepseek_base_url=deepseek_base_url,
             deepseek_model=deepseek_model,
+            siliconflow_api_key=(
+                siliconflow_key if free_first and openrouter_key else ""
+            ),
+            siliconflow_base_url=env.get(
+                "SILICONFLOW_BASE_URL", DEFAULT_SILICONFLOW_BASE_URL
+            ),
+            siliconflow_glm_model=siliconflow_glm_model,
+            siliconflow_deepseek_model=siliconflow_deepseek_model,
             request_timeout_seconds=_parse_float(env.get("MODEL_COUNCIL_REQUEST_TIMEOUT"), 20.0),
             overall_timeout_seconds=_parse_float(env.get("MODEL_COUNCIL_OVERALL_TIMEOUT"), 22.0),
             max_output_tokens=_parse_int(env.get("MODEL_COUNCIL_MAX_OUTPUT_TOKENS"), 800),
@@ -495,6 +512,16 @@ class CouncilConfig:
                 "role": "risk_challenge_analyst",
                 "configured": self.provider_enabled("deepseek"),
             },
+            "siliconflow_fallback": {
+                "base_url": self.siliconflow_base_url.rstrip("/"),
+                "glm_model": self.siliconflow_glm_model,
+                "deepseek_model": self.siliconflow_deepseek_model,
+                "configured": bool(
+                    self.siliconflow_api_key.strip()
+                    and self.siliconflow_glm_model.strip()
+                    and self.siliconflow_deepseek_model.strip()
+                ),
+            },
             "request_timeout_seconds": self.request_timeout_seconds,
             "overall_timeout_seconds": self.overall_timeout_seconds,
             "max_output_tokens": self.max_output_tokens,
@@ -513,6 +540,41 @@ class AnalystAdapter(Protocol):
         *,
         allowed_evidence_ids: Sequence[str],
     ) -> AnalystOpinion | Mapping[str, Any]: ...
+
+
+class FallbackAnalyst:
+    """Try ordered analyst routes without exposing credentials or changing evidence."""
+
+    def __init__(self, *adapters: AnalystAdapter) -> None:
+        if not adapters:
+            raise ValueError("At least one analyst route is required")
+        self._adapters = adapters
+
+    def analyze(
+        self,
+        evidence: Mapping[str, Any],
+        *,
+        allowed_evidence_ids: Sequence[str],
+    ) -> AnalystOpinion | Mapping[str, Any]:
+        last_error: Exception | None = None
+        for adapter in self._adapters:
+            try:
+                return adapter.analyze(
+                    evidence,
+                    allowed_evidence_ids=allowed_evidence_ids,
+                )
+            except (
+                AnalystProviderError,
+                AnalystTimeout,
+                AnalystTransportError,
+                InvalidAnalystResponse,
+                TimeoutError,
+                socket.timeout,
+            ) as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise AnalystTransportError("No analyst route was attempted")
 
 
 HttpTransport = Callable[[urllib.request.Request, float], bytes]
@@ -907,7 +969,7 @@ class ModelCouncil:
         self._deepseek_adapter = deepseek_adapter
         if self.config.provider_enabled("glm"):
             if self._glm_adapter is None:
-                self._glm_adapter = OpenAICompatibleAnalyst(
+                primary = OpenAICompatibleAnalyst(
                     provider="glm",
                     role="fundamental_evidence_analyst",
                     api_key=self.config.glm_api_key,
@@ -919,9 +981,29 @@ class ModelCouncil:
                     ),
                     max_output_tokens=self.config.max_output_tokens,
                 )
+                self._glm_adapter = primary
+                if (
+                    self.config.siliconflow_api_key.strip()
+                    and self.config.siliconflow_glm_model.strip()
+                ):
+                    self._glm_adapter = FallbackAnalyst(
+                        primary,
+                        OpenAICompatibleAnalyst(
+                            provider="glm",
+                            role="fundamental_evidence_analyst",
+                            api_key=self.config.siliconflow_api_key,
+                            base_url=self.config.siliconflow_base_url,
+                            model=self.config.siliconflow_glm_model,
+                            timeout_seconds=min(
+                                self.config.request_timeout_seconds,
+                                self.config.overall_timeout_seconds,
+                            ),
+                            max_output_tokens=self.config.max_output_tokens,
+                        ),
+                    )
         if self.config.provider_enabled("deepseek"):
             if self._deepseek_adapter is None:
-                self._deepseek_adapter = OpenAICompatibleAnalyst(
+                primary = OpenAICompatibleAnalyst(
                     provider="deepseek",
                     role="risk_challenge_analyst",
                     api_key=self.config.deepseek_api_key,
@@ -933,6 +1015,26 @@ class ModelCouncil:
                     ),
                     max_output_tokens=self.config.max_output_tokens,
                 )
+                self._deepseek_adapter = primary
+                if (
+                    self.config.siliconflow_api_key.strip()
+                    and self.config.siliconflow_deepseek_model.strip()
+                ):
+                    self._deepseek_adapter = FallbackAnalyst(
+                        primary,
+                        OpenAICompatibleAnalyst(
+                            provider="deepseek",
+                            role="risk_challenge_analyst",
+                            api_key=self.config.siliconflow_api_key,
+                            base_url=self.config.siliconflow_base_url,
+                            model=self.config.siliconflow_deepseek_model,
+                            timeout_seconds=min(
+                                self.config.request_timeout_seconds,
+                                self.config.overall_timeout_seconds,
+                            ),
+                            max_output_tokens=self.config.max_output_tokens,
+                        ),
+                    )
 
     @property
     def enabled(self) -> bool:

@@ -232,6 +232,8 @@ Biến cấu hình:
 - `SILICONFLOW_API_KEY`, `SILICONFLOW_GLM_MODEL`, `SILICONFLOW_DEEPSEEK_MODEL`:
   tuyến miễn phí tùy chọn; phải chọn model đang hiển thị giá 0đ trong tài khoản
 - `GLM_API_KEY`, `DEEPSEEK_API_KEY`: để trống cho đến khi bạn điền key thật
+- `SILICONFLOW_FREE_MODEL`: dùng cùng một model 0đ cho cả hai vai trò. Khi
+  OpenRouter lỗi quota/auth/model/timeout, `/deep` tự thử SiliconFlow trong cùng lượt.
 - `GLM_BASE_URL=https://api.z.ai/api/paas/v4`, `GLM_MODEL=glm-5.2`
 - `DEEPSEEK_BASE_URL=https://api.deepseek.com`, `DEEPSEEK_MODEL=deepseek-v4-flash`
 - `MODEL_COUNCIL_REQUEST_TIMEOUT=20`, `MODEL_COUNCIL_OVERALL_TIMEOUT=22`

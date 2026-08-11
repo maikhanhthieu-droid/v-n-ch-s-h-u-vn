@@ -94,6 +94,7 @@ jobs:
           OPENROUTER_FREE_MODEL: ${{ vars.OPENROUTER_FREE_MODEL || 'openrouter/free' }}
           SILICONFLOW_GLM_MODEL: ${{ vars.SILICONFLOW_GLM_MODEL }}
           SILICONFLOW_DEEPSEEK_MODEL: ${{ vars.SILICONFLOW_DEEPSEEK_MODEL }}
+          SILICONFLOW_FREE_MODEL: ${{ vars.SILICONFLOW_FREE_MODEL }}
           GLM_MODEL: "glm-5.2"
           DEEPSEEK_MODEL: "deepseek-v4-flash"
           GEMINI_DAILY_BUDGET: "2"

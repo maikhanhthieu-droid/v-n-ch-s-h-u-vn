@@ -16,6 +16,7 @@ from model_council import (  # noqa: E402
     AnalystOpinion,
     AnalystProviderError,
     CouncilConfig,
+    FallbackAnalyst,
     InvalidAnalystResponse,
     ModelCouncil,
     OpenAICompatibleAnalyst,
@@ -164,6 +165,32 @@ class ModelCouncilTests(unittest.TestCase):
         self.assertEqual(config.glm_model, "openrouter/free")
         self.assertEqual(config.deepseek_model, "openrouter/free")
         self.assertNotIn("free-secret", repr(config))
+
+    def test_openrouter_can_fall_back_to_siliconflow_in_the_same_review(self):
+        config = CouncilConfig.from_env(
+            {
+                "OPENROUTER_API_KEY": "openrouter-secret",
+                "SILICONFLOW_API_KEY": "siliconflow-secret",
+                "SILICONFLOW_FREE_MODEL": "shared-free-model",
+                "SILICONFLOW_GLM_MODEL": "free-glm-model",
+            }
+        )
+        self.assertEqual(config.glm_base_url, "https://openrouter.ai/api/v1")
+        self.assertEqual(config.siliconflow_base_url, "https://api.siliconflow.com/v1")
+        self.assertEqual(config.siliconflow_glm_model, "free-glm-model")
+        self.assertEqual(config.siliconflow_deepseek_model, "shared-free-model")
+        self.assertNotIn("siliconflow-secret", repr(config))
+
+        primary = StaticAdapter(
+            error=AnalystProviderError("rate_limit", http_status=429)
+        )
+        fallback = StaticAdapter(result=opinion(summary="SiliconFlow succeeded."))
+        adapter = FallbackAnalyst(primary, fallback)
+        result = adapter.analyze({"price": 10}, allowed_evidence_ids=("price:1",))
+
+        self.assertEqual(result["summary"], "SiliconFlow succeeded.")
+        self.assertEqual(primary.calls, 1)
+        self.assertEqual(fallback.calls, 1)
 
     def test_free_first_can_be_disabled_to_use_direct_vendor_keys(self):
         config = CouncilConfig.from_env(
