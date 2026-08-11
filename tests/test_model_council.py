@@ -149,6 +149,37 @@ class ModelCouncilTests(unittest.TestCase):
         self.assertEqual(shared_cooldown.configuration_cooldown_seconds, 321)
         self.assertEqual(shared_cooldown.transient_cooldown_seconds, 321)
 
+    def test_openrouter_free_key_powers_both_roles_before_paid_vendor_keys(self):
+        config = CouncilConfig.from_env(
+            {
+                "OPENROUTER_API_KEY": "free-secret",
+                "GLM_API_KEY": "paid-glm-secret",
+                "DEEPSEEK_API_KEY": "paid-deepseek-secret",
+            }
+        )
+
+        self.assertTrue(config.effective_enabled)
+        self.assertEqual(config.glm_base_url, "https://openrouter.ai/api/v1")
+        self.assertEqual(config.deepseek_base_url, "https://openrouter.ai/api/v1")
+        self.assertEqual(config.glm_model, "openrouter/free")
+        self.assertEqual(config.deepseek_model, "openrouter/free")
+        self.assertNotIn("free-secret", repr(config))
+
+    def test_free_first_can_be_disabled_to_use_direct_vendor_keys(self):
+        config = CouncilConfig.from_env(
+            {
+                "MODEL_COUNCIL_FREE_FIRST": "false",
+                "OPENROUTER_API_KEY": "free-secret",
+                "GLM_API_KEY": "glm-secret",
+                "DEEPSEEK_API_KEY": "deepseek-secret",
+            }
+        )
+
+        self.assertEqual(config.glm_base_url, "https://api.z.ai/api/paas/v4")
+        self.assertEqual(config.deepseek_base_url, "https://api.deepseek.com")
+        self.assertEqual(config.glm_model, "glm-5.2")
+        self.assertEqual(config.deepseek_model, "deepseek-v4-flash")
+
     def test_secret_values_are_absent_from_config_and_adapter_repr(self):
         config = enabled_config()
         rendered = repr(config)

@@ -4076,17 +4076,20 @@ def _format_council_shadow(report: CouncilReport | None) -> str:
     lines = [f"Trạng thái AI: {report.status}."]
     for review in report.reviews:
         opinion = review.opinion
+        provider_label = labels.get(review.provider, review.provider)
+        if review.model == "openrouter/free" or review.model.endswith(":free"):
+            provider_label += " (vai trò qua OpenRouter free)"
         failure_kind = str(getattr(review, "failure_kind", "") or "").lower()
         successful = review.status == "ok" and opinion.verdict != "abstain"
         if successful:
             detail = (
-                f"{labels.get(review.provider, review.provider)} — {opinion.verdict}, "
+                f"{provider_label} — {opinion.verdict}, "
                 f"tự tin nội bộ {opinion.confidence:.0%}: {opinion.summary}"
             )
         else:
             action = actions.get(failure_kind) or actions.get(str(review.status).lower())
             detail = (
-                f"{labels.get(review.provider, review.provider)} — "
+                f"{provider_label} — "
                 f"{action or opinion.summary or 'không có phản hồi hợp lệ'}"
             )
             retry_after = getattr(review, "retry_after_seconds", None)

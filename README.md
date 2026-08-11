@@ -225,6 +225,12 @@ lift ngoài mẫu trên đủ dữ liệu live.
 
 Biến cấu hình:
 
+- `OPENROUTER_API_KEY`: tuyến miễn phí ưu tiên. Một key chạy hai vai trò độc lập
+  qua `openrouter/free`; mỗi `/deep` dùng hai request OpenRouter và một Gemini
+- `MODEL_COUNCIL_FREE_FIRST=true`: ưu tiên OpenRouter, rồi SiliconFlow nếu đã
+  khai báo đủ hai model 0đ; đặt `false` để quay về API Z.AI/DeepSeek trực tiếp
+- `SILICONFLOW_API_KEY`, `SILICONFLOW_GLM_MODEL`, `SILICONFLOW_DEEPSEEK_MODEL`:
+  tuyến miễn phí tùy chọn; phải chọn model đang hiển thị giá 0đ trong tài khoản
 - `GLM_API_KEY`, `DEEPSEEK_API_KEY`: để trống cho đến khi bạn điền key thật
 - `GLM_BASE_URL=https://api.z.ai/api/paas/v4`, `GLM_MODEL=glm-5.2`
 - `DEEPSEEK_BASE_URL=https://api.deepseek.com`, `DEEPSEEK_MODEL=deepseek-v4-flash`

@@ -50,6 +50,9 @@ DEFAULT_GLM_BASE_URL = "https://api.z.ai/api/paas/v4"
 DEFAULT_GLM_MODEL = "glm-5.2"
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
+DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_OPENROUTER_FREE_MODEL = "openrouter/free"
+DEFAULT_SILICONFLOW_BASE_URL = "https://api.siliconflow.com/v1"
 
 PROVIDER_ORDER = ("glm", "deepseek")
 VERDICTS = frozenset({"support", "neutral", "reject", "abstain"})
@@ -415,14 +418,45 @@ class CouncilConfig:
 
         env = os.environ if environ is None else environ
         shared_error_cooldown = env.get("MODEL_COUNCIL_ERROR_COOLDOWN")
+        free_first = _parse_bool(env.get("MODEL_COUNCIL_FREE_FIRST"), True)
+        openrouter_key = env.get("OPENROUTER_API_KEY", "").strip()
+        siliconflow_key = env.get("SILICONFLOW_API_KEY", "").strip()
+        siliconflow_glm_model = env.get("SILICONFLOW_GLM_MODEL", "").strip()
+        siliconflow_deepseek_model = env.get("SILICONFLOW_DEEPSEEK_MODEL", "").strip()
+
+        glm_key = env.get("GLM_API_KEY", "")
+        glm_base_url = env.get("GLM_BASE_URL", DEFAULT_GLM_BASE_URL)
+        glm_model = env.get("GLM_MODEL", DEFAULT_GLM_MODEL)
+        deepseek_key = env.get("DEEPSEEK_API_KEY", "")
+        deepseek_base_url = env.get("DEEPSEEK_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL)
+        deepseek_model = env.get("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL)
+
+        # One OpenRouter free key can power both independent analyst roles. The
+        # response remains labelled by role, while ``model`` records the actual
+        # free router rather than pretending it came from the paid vendor API.
+        if free_first and openrouter_key:
+            free_model = env.get("OPENROUTER_FREE_MODEL", DEFAULT_OPENROUTER_FREE_MODEL)
+            glm_key = deepseek_key = openrouter_key
+            glm_base_url = deepseek_base_url = env.get(
+                "OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_BASE_URL
+            )
+            glm_model = env.get("OPENROUTER_GLM_MODEL", free_model)
+            deepseek_model = env.get("OPENROUTER_DEEPSEEK_MODEL", free_model)
+        elif free_first and siliconflow_key and siliconflow_glm_model and siliconflow_deepseek_model:
+            glm_key = deepseek_key = siliconflow_key
+            glm_base_url = deepseek_base_url = env.get(
+                "SILICONFLOW_BASE_URL", DEFAULT_SILICONFLOW_BASE_URL
+            )
+            glm_model = siliconflow_glm_model
+            deepseek_model = siliconflow_deepseek_model
         return cls(
             enabled=_parse_bool(env.get("MODEL_COUNCIL_ENABLED"), True),
-            glm_api_key=env.get("GLM_API_KEY", ""),
-            deepseek_api_key=env.get("DEEPSEEK_API_KEY", ""),
-            glm_base_url=env.get("GLM_BASE_URL", DEFAULT_GLM_BASE_URL),
-            glm_model=env.get("GLM_MODEL", DEFAULT_GLM_MODEL),
-            deepseek_base_url=env.get("DEEPSEEK_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL),
-            deepseek_model=env.get("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL),
+            glm_api_key=glm_key,
+            deepseek_api_key=deepseek_key,
+            glm_base_url=glm_base_url,
+            glm_model=glm_model,
+            deepseek_base_url=deepseek_base_url,
+            deepseek_model=deepseek_model,
             request_timeout_seconds=_parse_float(env.get("MODEL_COUNCIL_REQUEST_TIMEOUT"), 20.0),
             overall_timeout_seconds=_parse_float(env.get("MODEL_COUNCIL_OVERALL_TIMEOUT"), 22.0),
             max_output_tokens=_parse_int(env.get("MODEL_COUNCIL_MAX_OUTPUT_TOKENS"), 800),
