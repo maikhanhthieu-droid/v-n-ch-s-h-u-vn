@@ -47,6 +47,7 @@ jobs:
             data/watchlists.json
             data/signal_state.json
             data/signal_ledger.json
+            data/assistant_conversations.json
           key: vn-equity-bot-state-${{ github.run_id }}
           restore-keys: |
             vn-equity-bot-state-
@@ -86,15 +87,16 @@ jobs:
           TELEGRAM_ALLOWED_CHAT_IDS: ${{ secrets.TELEGRAM_ALLOWED_CHAT_IDS || secrets.TELEGRAM_CHAT_ID }}
           DATA_DIR: data
           GEMINI_GOOGLE_SEARCH: ${{ vars.GEMINI_GOOGLE_SEARCH || 'false' }}
-          MODEL_COUNCIL_ENABLED: ${{ vars.MODEL_COUNCIL_ENABLED || 'true' }}
+          MODEL_COUNCIL_ENABLED: ${{ vars.MODEL_COUNCIL_ENABLED || 'false' }}
           GLM_MODEL: "glm-5.2"
           DEEPSEEK_MODEL: "deepseek-v4-flash"
-          GEMINI_DAILY_BUDGET: "6"
-          DEEP_DAILY_LIMIT: "3"
+          GEMINI_DAILY_BUDGET: "2"
+          DEEP_DAILY_LIMIT: "1"
           SCAN_DAILY_LIMIT: "1"
-          DAILY_SHORTLIST_LIMIT: "3"
-          MAX_SIGNALS_PER_SCAN: "3"
-          MODEL_COUNCIL_DAILY_BUDGET: "3"
+          DAILY_SHORTLIST_LIMIT: "2"
+          MAX_SIGNALS_PER_SCAN: "2"
+          SCAN_WEEKDAYS: "0"
+          MODEL_COUNCIL_DAILY_BUDGET: "1"
           MODEL_COUNCIL_ERROR_COOLDOWN: "900"
           RESEARCH_COMMAND_COOLDOWN: "60"
           SCAN_WORKERS: "2"
@@ -129,4 +131,5 @@ jobs:
             data/watchlists.json
             data/signal_state.json
             data/signal_ledger.json
+            data/assistant_conversations.json
           key: vn-equity-bot-state-${{ github.run_id }}
