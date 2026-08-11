@@ -3,7 +3,13 @@ from pathlib import Path
 from unittest import TestCase
 from unittest.mock import Mock
 
-from bot import AssistantConversationStore, BotApplication, WatchlistStore
+from bot import (
+    AssistantConversationStore,
+    BotApplication,
+    FundamentalSnapshot,
+    Quote,
+    WatchlistStore,
+)
 
 
 class AssistantPanelTests(TestCase):
@@ -49,3 +55,63 @@ class AssistantPanelTests(TestCase):
             summary = app.handle_text("/ai_summary", 7)
             self.assertIn("TRẠNG THÁI: CHỜ", summary)
             analyzer.summarize_assistant_panel.assert_called_once()
+
+    def test_deep_opens_panel_and_preserves_successful_views_when_one_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            conversation_store = AssistantConversationStore(
+                Path(directory) / "conversations.json"
+            )
+            provider = Mock()
+            provider.get_quote.return_value = Quote("FPT", "FPT", 100.0, 99.0)
+            provider.get_history.return_value = []
+            provider.get_fundamentals.return_value = FundamentalSnapshot("FPT", "FPT")
+            scanner = Mock()
+            scanner.render_signal.return_value = "deep result"
+            scanner.assistant_views_for.return_value = {
+                "glm": "CHỜ vùng quant; cơ bản ổn",
+                "gemini": "THEO DÕI dòng tiền",
+            }
+            app = BotApplication(
+                telegram=Mock(),
+                provider=provider,
+                store=WatchlistStore(Path(directory) / "watchlists.json"),
+                scanner=scanner,
+                conversation_store=conversation_store,
+                research_command_cooldown=0,
+            )
+
+            result = app.handle_text("/deep FPT", 7)
+
+            self.assertIn("Tự động chuyển sang panel bổ sung", result)
+            self.assertIn("Thiếu: DeepSeek", result)
+            self.assertIn("<b>GLM</b> ✅", result)
+            self.assertIn("<b>Gemini</b> ✅", result)
+            self.assertIn("<b>DeepSeek</b> ⏳ chưa nhận", result)
+            session = conversation_store.get(7)
+            self.assertEqual(set(session["responses"]), {"glm", "gemini"})
+
+    def test_deep_does_not_open_panel_when_all_three_views_succeed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            provider = Mock()
+            provider.get_quote.return_value = Quote("FPT", "FPT", 100.0, 99.0)
+            provider.get_history.return_value = []
+            provider.get_fundamentals.return_value = FundamentalSnapshot("FPT", "FPT")
+            scanner = Mock()
+            scanner.render_signal.return_value = "deep result"
+            scanner.assistant_views_for.return_value = {
+                "glm": "ok",
+                "deepseek": "ok",
+                "gemini": "ok",
+            }
+            app = BotApplication(
+                telegram=Mock(),
+                provider=provider,
+                store=WatchlistStore(Path(directory) / "watchlists.json"),
+                scanner=scanner,
+                conversation_store=AssistantConversationStore(
+                    Path(directory) / "conversations.json"
+                ),
+                research_command_cooldown=0,
+            )
+
+            self.assertEqual(app.handle_text("/deep FPT", 7), "deep result")

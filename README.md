@@ -14,6 +14,8 @@ DeepSeek là các lớp nghiên cứu tùy chọn, không được quyền sửa
 - `/ta FPT`: MA5, MA20, RSI14, hỗ trợ/kháng cự gần
 - `/deep FPT`: nghiên cứu sâu tối đa 3 lượt/ngày; GLM kiểm tra chất lượng doanh
   nghiệp, DeepSeek phản biện rủi ro và Gemini tổng hợp/bổ sung dữ liệu hiện tại.
+  Nếu một trợ lý hết quota hoặc lỗi, bot giữ các góc nhìn đã nhận và tự mở panel
+  Telegram cho đúng mã để bạn chỉ bổ sung trợ lý còn thiếu bằng `/ai_add`.
   Ba lớp AI chỉ diễn giải evidence, không sửa điểm 100, target/stop hay backtest
 - `/news FPT` hoặc `/news Thông tư 14/2026`: phân tích tiêu đề theo hai chiều,
   luôn gắn nguồn và nêu phần chưa thể xác nhận

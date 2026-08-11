@@ -4146,6 +4146,7 @@ class DeepSignalScanner:
         self.require_dated_history = bool(require_dated_history)
         self.max_history_staleness_days = max(1, int(max_history_staleness_days))
         self._council_reports: dict[str, CouncilReport] = {}
+        self._assistant_views: dict[str, dict[str, str]] = {}
         self._council_lock = threading.Lock()
 
     @staticmethod
@@ -4314,6 +4315,12 @@ class DeepSignalScanner:
             reviews.append(payload)
         return reviews
 
+    def assistant_views_for(self, symbol: str) -> dict[str, str]:
+        """Return only successful AI views from the latest /deep call."""
+
+        with self._council_lock:
+            return dict(self._assistant_views.get(symbol.upper(), {}))
+
     def council_status_text(self) -> str:
         if self.council is None or not self.council.enabled:
             return "tắt/chưa có API key GLM hoặc DeepSeek"
@@ -4350,6 +4357,7 @@ class DeepSignalScanner:
         council_text = _format_council_shadow(None)
         with self._council_lock:
             self._council_reports.pop(signal.symbol.upper(), None)
+            self._assistant_views.pop(signal.symbol.upper(), None)
         if self.council is not None and self.council.enabled:
             try:
                 allowed = True
@@ -4393,13 +4401,29 @@ class DeepSignalScanner:
                     signal.symbol,
                     type(exc).__name__,
                 )
+        gemini_text = self.gemini.analyze(
+            signal,
+            council_context=council_context,
+            allow_burst=allow_burst,
+        )
+        views: dict[str, str] = {}
+        if report is not None:
+            for review in report.reviews:
+                if review.status == "ok" and review.opinion.verdict != "abstain":
+                    views[review.provider] = review.opinion.summary
+        unavailable_markers = (
+            "nghỉ do vượt giới hạn api",
+            "không phản hồi lúc này",
+            "chưa có api key",
+            "đã dùng hết ngân sách",
+        )
+        if not any(marker in gemini_text.lower() for marker in unavailable_markers):
+            views["gemini"] = gemini_text
+        with self._council_lock:
+            self._assistant_views[signal.symbol.upper()] = views
         return format_deep_signal(
             signal,
-            self.gemini.analyze(
-                signal,
-                council_context=council_context,
-                allow_burst=allow_burst,
-            ),
+            gemini_text,
             council_text=council_text,
         )
 
@@ -4858,6 +4882,42 @@ class BotApplication:
             lines.extend(["", "<b>Tổng hợp trung lập</b>", html.escape(summary)])
         return "\n".join(lines)
 
+    def _start_assistant_panel_from_signal(
+        self,
+        chat_id: int | str,
+        signal: DeepSignal,
+        initial_views: dict[str, str] | None = None,
+    ) -> str:
+        if self.conversation_store is None:
+            return "Bàn trợ lý chưa được cấu hình."
+        quote = signal.quote
+        snapshot = signal.snapshot
+        breakdown = signal.breakdown or build_score_breakdown(
+            snapshot, quote, signal.bars, signal.macro
+        )[0]
+        plan = signal.trade_plan or build_trade_plan(quote, signal.bars)
+        evidence = (
+            f"Mã {signal.symbol}; ngày {ApiUsageStore._today()}; giá {quote.price}; "
+            f"score {breakdown.total}/100; cơ bản {breakdown.business}/30; "
+            f"định giá {breakdown.valuation}/25; kỹ thuật {breakdown.technical}/25; "
+            f"rủi ro {breakdown.risk}/10; vĩ mô {breakdown.macro}/10; "
+            f"vùng vào {plan.entry_low}-{plan.entry_high}; stop {plan.stop}; "
+            f"T1/T2/T3 {plan.target_1}/{plan.target_2}/{plan.target_3}; "
+            f"backtest20 {signal.backtest}; backtest60 {signal.backtest_3m}; "
+            f"lý do {', '.join(signal.reasons[:6])}."
+        )
+        session = self.conversation_store.start(chat_id, signal.symbol, evidence)
+        for provider_name, response in (initial_views or {}).items():
+            if provider_name in AssistantConversationStore.PROVIDERS and response.strip():
+                session = self.conversation_store.add_response(
+                    chat_id,
+                    provider_name,
+                    response,
+                )
+        return self._panel_view(session) + "\n\n<b>Prompt đầu tiên</b>\n<pre>" + html.escape(
+            self._panel_prompt(session, "trợ lý được chọn")[:2600]
+        ) + "</pre>"
+
     def _start_assistant_panel(self, chat_id: int | str, symbol: str) -> str:
         if self.conversation_store is None:
             return "Bàn trợ lý chưa được cấu hình."
@@ -4874,24 +4934,7 @@ class BotApplication:
             macro,
             backtest_cost_pct=float(scanner_cost),
         )
-        breakdown = signal.breakdown or build_score_breakdown(
-            snapshot, quote, bars, macro
-        )[0]
-        plan = signal.trade_plan or build_trade_plan(quote, bars)
-        evidence = (
-            f"Mã {signal.symbol}; ngày {ApiUsageStore._today()}; giá {quote.price}; "
-            f"score {breakdown.total}/100; cơ bản {breakdown.business}/30; "
-            f"định giá {breakdown.valuation}/25; kỹ thuật {breakdown.technical}/25; "
-            f"rủi ro {breakdown.risk}/10; vĩ mô {breakdown.macro}/10; "
-            f"vùng vào {plan.entry_low}-{plan.entry_high}; stop {plan.stop}; "
-            f"T1/T2/T3 {plan.target_1}/{plan.target_2}/{plan.target_3}; "
-            f"backtest20 {signal.backtest}; backtest60 {signal.backtest_3m}; "
-            f"lý do {', '.join(signal.reasons[:6])}."
-        )
-        session = self.conversation_store.start(chat_id, signal.symbol, evidence)
-        return self._panel_view(session) + "\n\n<b>Prompt đầu tiên</b>\n<pre>" + html.escape(
-            self._panel_prompt(session, "trợ lý được chọn")[:2600]
-        ) + "</pre>"
+        return self._start_assistant_panel_from_signal(chat_id, signal)
 
     def handle_update(self, update: dict[str, Any]) -> None:
         message = update.get("message") if isinstance(update, dict) else None
@@ -5119,6 +5162,33 @@ class BotApplication:
                     # Only user-confirmed deep analysis of a system shortlist is
                     # recorded as a live signal. Screening alone is never a trade.
                     self._record_live_signal(signal)
+                view_getter = getattr(scanner, "assistant_views_for", None)
+                views = view_getter(signal.symbol) if callable(view_getter) else {}
+                if not isinstance(views, dict):
+                    # Backwards-compatible with custom scanners that do not yet
+                    # expose structured assistant results.
+                    views = {}
+                required = {"glm", "deepseek", "gemini"}
+                missing = sorted(required.difference(views))
+                if missing and self.conversation_store is not None:
+                    fallback_panel = self._start_assistant_panel_from_signal(
+                        chat_id,
+                        signal,
+                        initial_views=views,
+                    )
+                    missing_labels = {
+                        "glm": "GLM",
+                        "deepseek": "DeepSeek",
+                        "gemini": "Gemini",
+                    }
+                    rendered += (
+                        "\n\n<b>⚠️ Tự động chuyển sang panel bổ sung</b>\n"
+                        "Thiếu: "
+                        + ", ".join(missing_labels[item] for item in missing)
+                        + ". Các kết quả đã nhận được đã được giữ lại; bạn chỉ cần mở web, "
+                        "dán prompt rồi dùng <code>/ai_add tên_trợ_lý nội_dung</code>.\n\n"
+                        + fallback_panel
+                    )
                 return rendered
             if command in {"/news", "/new", "/tintuc", "/macro"}:
                 argument = _argument(text)
