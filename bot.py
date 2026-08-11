@@ -18,6 +18,7 @@ Commands:
     /signals_on
     /signals_off
     /signals_status
+    /performance
     /market
     /add <TICKER>
     /remove <TICKER>
@@ -33,6 +34,7 @@ delayed, incomplete, or unavailable.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import logging
@@ -47,8 +49,8 @@ import time
 import unicodedata
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.error import HTTPError, URLError
@@ -59,6 +61,9 @@ try:
     from google import genai
 except ImportError:  # The quantitative scanner still works without the optional SDK.
     genai = None
+
+from signal_ledger import SignalLedger, SignalLedgerError
+from model_council import CouncilReport, ModelCouncil, build_from_env as build_model_council
 
 
 LOG = logging.getLogger("vn_equity_bot")
@@ -72,7 +77,7 @@ DEFAULT_SCAN_TIME = "20:30"
 DEFAULT_MONTHLY_SIGNAL_LIMIT = 2
 DEFAULT_SIGNAL_COOLDOWN_DAYS = 30
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
-DEFAULT_GEMINI_FALLBACK_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_GEMINI_FALLBACK_MODEL = "gemini-3.1-flash-lite"
 DEFAULT_GEMINI_THINKING_LEVEL = "minimal"
 DEFAULT_GEMINI_MAX_OUTPUT_TOKENS = 1000
 DEFAULT_GEMINI_TIMEOUT = 30
@@ -84,6 +89,7 @@ DEFAULT_GEMINI_DAILY_BUDGET = 12
 DEFAULT_DEEP_DAILY_LIMIT = 10
 DEFAULT_SCAN_DAILY_LIMIT = 2
 DEFAULT_NEWS_DAILY_LIMIT = 8
+DEFAULT_COUNCIL_DAILY_BUDGET = 4
 DEFAULT_SCAN_WORKERS = 2
 DEFAULT_VNSTOCK_DAILY_BUDGET = 60
 DEFAULT_VNSTOCK_REQUESTS_PER_MINUTE = 12
@@ -99,6 +105,14 @@ DEFAULT_VIMO_CACHE_TTL = 900.0
 DEFAULT_VIMO_MAX_AGE_HOURS = 72.0
 DEFAULT_NEWS_CACHE_TTL = 900.0
 DEFAULT_NEWS_MAX_ITEMS = 5
+DEFAULT_BACKTEST_COST_PCT = 0.45
+DEFAULT_MIN_BACKTEST_RESOLVED = 8
+DEFAULT_MIN_BACKTEST_WIN_LOWER = 45.0
+DEFAULT_MIN_BACKTEST_EXPECTANCY_R = 0.05
+DEFAULT_MIN_BACKTEST_FILL_RATE = 40.0
+DEFAULT_MAX_HISTORY_STALENESS_DAYS = 10
+SCORE_VERSION = "v2.0"
+GEMINI_PROMPT_VERSION = "v2.0"
 
 VN100_SYMBOLS = [
     "AAA", "ACB", "ANV", "APH", "ASM", "BCM", "BID", "BMP", "BSI", "BVH",
@@ -205,6 +219,17 @@ class PriceBar:
     low: float | None = None
     open_price: float | None = None
     volume: int | None = None
+    date: str | None = None
+    source: str = ""
+    adjusted: bool = False
+    # Yahoo's adjusted OHLC is appropriate for technical/backtest continuity,
+    # but live targets/stops are created from an unadjusted executable quote.
+    # Retain the provider's raw price basis so the outcome ledger never mixes
+    # those two coordinate systems after a dividend or split adjustment.
+    raw_close: float | None = None
+    raw_high: float | None = None
+    raw_low: float | None = None
+    raw_open: float | None = None
 
 
 @dataclass(frozen=True)
@@ -286,6 +311,9 @@ class ScoreBreakdown:
     macro: int
     total: int
     pattern: str
+    data_quality: int = 100
+    confidence_penalty: int = 0
+    version: str = SCORE_VERSION
 
 
 @dataclass(frozen=True)
@@ -317,6 +345,16 @@ class BacktestResult:
     median_return: float | None = None
     lookahead_sessions: int = 20
     target_label: str = "T1"
+    resolved: int = 0
+    effective_samples: int = 0
+    hit_rate_lower: float | None = None
+    expected_r: float | None = None
+    median_net_return: float | None = None
+    cost_pct: float = DEFAULT_BACKTEST_COST_PCT
+    entry_policy: str = "next-open"
+    sample_indices: tuple[int, ...] = ()
+    sample_dates: tuple[str, ...] = ()
+    not_filled: int = 0
 
 
 @dataclass(frozen=True)
@@ -807,6 +845,91 @@ class NeutralNewsService:
         return self.headlines(query, required_terms=aliases)
 
 
+def _bar_date(value: Any) -> str | None:
+    """Normalize provider timestamps without inventing a missing trading date."""
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    try:
+        if hasattr(value, "to_pydatetime"):
+            converted = value.to_pydatetime()
+            if isinstance(converted, datetime):
+                return converted.date().isoformat()
+    except (TypeError, ValueError, OverflowError):
+        pass
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        try:
+            timestamp = float(value)
+            if abs(timestamp) > 10_000_000_000:
+                timestamp /= 1000.0
+            return datetime.fromtimestamp(timestamp, timezone.utc).date().isoformat()
+        except (ValueError, OSError, OverflowError):
+            return None
+    text = str(value).strip()
+    match = re.match(r"^(\d{4}-\d{2}-\d{2})", text)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _chronological_bars(bars: Iterable[PriceBar]) -> list[PriceBar]:
+    """Sort and de-duplicate dated bars; preserve legacy undated fixtures."""
+
+    items = list(bars)
+    if not items or not all(item.date for item in items):
+        return items
+    by_date: dict[str, PriceBar] = {}
+    for item in sorted(items, key=lambda bar: str(bar.date)):
+        by_date[str(item.date)] = item
+    return list(by_date.values())
+
+
+def _ledger_price_bars(bars: Iterable[PriceBar]) -> list[dict[str, Any]]:
+    """Project OHLC onto the raw price basis used by live signal levels.
+
+    Technical analysis intentionally uses adjusted Yahoo history.  A live
+    signal's entry, target and stop, however, are created from the raw quote.
+    Prefer retained raw Yahoo values for settlement; non-adjusted providers
+    naturally fall back to their normal OHLC fields.  Missing raw fields stay
+    missing so the ledger can fail closed instead of inventing an open.
+    """
+
+    projected: list[dict[str, Any]] = []
+    for bar in bars:
+        has_raw_basis = bar.adjusted or any(
+            value is not None
+            for value in (bar.raw_close, bar.raw_high, bar.raw_low, bar.raw_open)
+        )
+        projected.append(
+            {
+                "date": bar.date,
+                "open": (
+                    bar.raw_open
+                    if bar.raw_open is not None
+                    else None if has_raw_basis else bar.open_price
+                ),
+                "high": (
+                    bar.raw_high
+                    if bar.raw_high is not None
+                    else None if has_raw_basis else bar.high
+                ),
+                "low": (
+                    bar.raw_low
+                    if bar.raw_low is not None
+                    else None if has_raw_basis else bar.low
+                ),
+                "close": (
+                    bar.raw_close
+                    if bar.raw_close is not None
+                    else None if has_raw_basis else bar.close
+                ),
+            }
+        )
+    return projected
+
+
 class YahooQuoteProvider:
     """Small, cache-aware Yahoo Finance chart client."""
 
@@ -887,24 +1010,69 @@ class YahooQuoteProvider:
         try:
             result = payload["chart"]["result"][0]
             quote_data = result["indicators"]["quote"][0]
+            timestamps = result.get("timestamp", [])
             closes = quote_data.get("close", [])
             highs = quote_data.get("high", [])
             lows = quote_data.get("low", [])
             opens = quote_data.get("open", [])
             volumes = quote_data.get("volume", [])
+            adjusted_blocks = result["indicators"].get("adjclose") or []
+            adjusted_closes = (
+                adjusted_blocks[0].get("adjclose", [])
+                if adjusted_blocks and isinstance(adjusted_blocks[0], dict)
+                else []
+            )
             bars: list[PriceBar] = []
             for index, close in enumerate(closes):
                 if close is None:
                     continue
+                raw_close = float(close)
+                if not math.isfinite(raw_close) or raw_close <= 0:
+                    continue
+                adjusted_candidate = (
+                    float(adjusted_closes[index])
+                    if index < len(adjusted_closes)
+                    and adjusted_closes[index] is not None
+                    else raw_close
+                )
+                adjusted_close = (
+                    adjusted_candidate
+                    if math.isfinite(adjusted_candidate) and adjusted_candidate > 0
+                    else raw_close
+                )
+                factor = adjusted_close / raw_close if raw_close > 0 else 1.0
+                is_adjusted = not math.isclose(factor, 1.0, rel_tol=1e-9, abs_tol=1e-9)
+
+                def raw_value(values: list[Any]) -> float | None:
+                    if index >= len(values) or values[index] is None:
+                        return None
+                    value = float(values[index])
+                    return value if math.isfinite(value) and value > 0 else None
+
+                def adjusted_value(values: list[Any]) -> float | None:
+                    raw = raw_value(values)
+                    if raw is None:
+                        return None
+                    value = raw * factor
+                    return value if math.isfinite(value) and value > 0 else None
+
                 bars.append(
                     PriceBar(
-                        close=float(close),
-                        high=float(highs[index]) if index < len(highs) and highs[index] is not None else None,
-                        low=float(lows[index]) if index < len(lows) and lows[index] is not None else None,
-                        open_price=float(opens[index]) if index < len(opens) and opens[index] is not None else None,
+                        close=adjusted_close,
+                        high=adjusted_value(highs),
+                        low=adjusted_value(lows),
+                        open_price=adjusted_value(opens),
                         volume=int(volumes[index]) if index < len(volumes) and volumes[index] is not None else None,
+                        date=_bar_date(timestamps[index]) if index < len(timestamps) else None,
+                        source="Yahoo Finance",
+                        adjusted=is_adjusted,
+                        raw_close=raw_close,
+                        raw_high=raw_value(highs),
+                        raw_low=raw_value(lows),
+                        raw_open=raw_value(opens),
                     )
                 )
+            bars = _chronological_bars(bars)
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise BotError(f"Chưa có dữ liệu lịch sử cho mã {normalized}.") from exc
         if len(bars) < 2:
@@ -1072,7 +1240,7 @@ def _history_window(range_value: str) -> tuple[str, str]:
     return start, end
 
 
-def _vnstock_bars(raw: Any, symbol: str) -> list[PriceBar]:
+def _vnstock_bars(raw: Any, symbol: str, source: str = "VNStock") -> list[PriceBar]:
     """Normalize a vnstock DataFrame without binding the bot to pandas APIs."""
 
     if raw is None:
@@ -1081,7 +1249,7 @@ def _vnstock_bars(raw: Any, symbol: str) -> list[PriceBar]:
         records = raw.to_dict("records") if hasattr(raw, "to_dict") else list(raw)
     except (TypeError, ValueError):
         return []
-    parsed: list[dict[str, float | int | None]] = []
+    parsed: list[dict[str, Any]] = []
     for item in records:
         if not isinstance(item, dict):
             continue
@@ -1090,17 +1258,27 @@ def _vnstock_bars(raw: Any, symbol: str) -> list[PriceBar]:
             value = _first_number(*values)
             return value if value is not None and math.isfinite(value) else None
 
-        close = finite_number(row.get("close"), row.get("c"))
+        def finite_price(*values: Any) -> float | None:
+            value = finite_number(*values)
+            return value if value is not None and value > 0 else None
+
+        close = finite_price(row.get("close"), row.get("c"))
         if close is None:
             continue
         volume = finite_number(row.get("volume"), row.get("v"))
         parsed.append(
             {
                 "close": close,
-                "high": finite_number(row.get("high"), row.get("h")),
-                "low": finite_number(row.get("low"), row.get("l")),
-                "open": finite_number(row.get("open"), row.get("o")),
-                "volume": int(volume) if volume is not None else None,
+                "high": finite_price(row.get("high"), row.get("h")),
+                "low": finite_price(row.get("low"), row.get("l")),
+                "open": finite_price(row.get("open"), row.get("o")),
+                "volume": int(volume) if volume is not None and volume > 0 else None,
+                "date": (
+                    _bar_date(row.get("time"))
+                    or _bar_date(row.get("date"))
+                    or _bar_date(row.get("trading_date"))
+                    or _bar_date(row.get("tradingdate"))
+                ),
             }
         )
     if len(parsed) < 2:
@@ -1116,16 +1294,20 @@ def _vnstock_bars(raw: Any, symbol: str) -> list[PriceBar]:
     def scaled(value: float | int | None) -> float | None:
         return float(value) * scale if value is not None else None
 
-    return [
+    bars = [
         PriceBar(
             close=float(row["close"]) * scale,
             high=scaled(row["high"]),
             low=scaled(row["low"]),
             open_price=scaled(row["open"]),
             volume=int(row["volume"]) if row["volume"] is not None else None,
+            date=row["date"],
+            source=f"VNStock/{source.upper()}",
+            adjusted=False,
         )
         for row in parsed
     ]
+    return _chronological_bars(bars)
 
 
 class VnstockHistoryClient:
@@ -1156,7 +1338,7 @@ class VnstockHistoryClient:
         vn_interval = "1D" if interval.lower() in {"1d", "d", "day"} else interval
         quote = self._quote_class(symbol=symbol.upper(), source=source.lower())
         raw = quote.history(start=start, end=end, interval=vn_interval)
-        bars = _vnstock_bars(raw, symbol)
+        bars = _vnstock_bars(raw, symbol, source)
         if len(bars) < 2:
             raise ValueError(f"vnstock {source} returned insufficient OHLCV for {symbol}")
         return bars
@@ -1795,6 +1977,7 @@ class ApiUsageStore:
         "deep_commands",
         "scan_commands",
         "news_commands",
+        "council_reviews",
     )
 
     def __init__(
@@ -1805,6 +1988,7 @@ class ApiUsageStore:
         deep_daily_limit: int = DEFAULT_DEEP_DAILY_LIMIT,
         scan_daily_limit: int = DEFAULT_SCAN_DAILY_LIMIT,
         news_daily_limit: int = DEFAULT_NEWS_DAILY_LIMIT,
+        council_daily_budget: int = DEFAULT_COUNCIL_DAILY_BUDGET,
     ):
         self.path = path
         self.limits = {
@@ -1813,6 +1997,7 @@ class ApiUsageStore:
             "deep_commands": max(1, int(deep_daily_limit)),
             "scan_commands": max(1, int(scan_daily_limit)),
             "news_commands": max(1, int(news_daily_limit)),
+            "council_reviews": max(1, int(council_daily_budget)),
         }
         self._lock = threading.Lock()
         self._data: dict[str, Any] = self._empty_data()
@@ -1909,6 +2094,7 @@ class ApiUsageStore:
         deep = data["deep_commands"]
         scan = data["scan_commands"]
         news = data["news_commands"]
+        council = data["council_reviews"]
         return (
             "<b>Ngân sách API an toàn hôm nay</b>\n"
             f"Gemini: {gemini['used']}/{gemini['limit']} "
@@ -1921,6 +2107,8 @@ class ApiUsageStore:
             f"— {self._meter(scan['used'], scan['limit'])}\n"
             f"/news: {news['used']}/{news['limit']} "
             f"— {self._meter(news['used'], news['limit'])}\n"
+            f"Council GLM+DeepSeek: {council['used']}/{council['limit']} "
+            f"— {self._meter(council['used'], council['limit'])}\n"
             f"Trạng thái Gemini: {html.escape(gemini_status)}\n"
             "Đặt lại lúc 00:00 (UTC+7). Đây là bộ đếm nội bộ, không phải quota trực tiếp từ nhà cung cấp."
         )
@@ -2003,7 +2191,7 @@ class GeminiAnalyzer:
         with self._state_lock:
             return max(0.0, self._quota_disabled_until - time.monotonic())
 
-    def _reserve_request_slot(self) -> None:
+    def _reserve_request_slot(self, bypass_min_interval: bool = False) -> None:
         with self._request_lock:
             remaining = self._quota_remaining()
             if remaining > 0:
@@ -2011,7 +2199,7 @@ class GeminiAnalyzer:
             delay = 0.0
             if self._last_request_at > 0:
                 delay = self.min_interval - (time.monotonic() - self._last_request_at)
-            if delay > 0:
+            if delay > 0 and not bypass_min_interval:
                 raise GeminiRequestCooldown(delay)
             if self.usage_store is not None:
                 allowed, _, _ = self.usage_store.claim("gemini_requests")
@@ -2019,23 +2207,40 @@ class GeminiAnalyzer:
                     raise GeminiDailyBudgetReached("Gemini daily safety budget reached")
             self._last_request_at = time.monotonic()
 
-    def _cached_result(self, symbol: str) -> str | None:
+    def _cached_result(self, cache_key: str) -> str | None:
         now = time.monotonic()
         with self._state_lock:
-            cached = self._cache.get(symbol)
+            cached = self._cache.get(cache_key)
             if cached is None:
                 return None
             expires_at, text = cached
             if expires_at <= now:
-                self._cache.pop(symbol, None)
+                self._cache.pop(cache_key, None)
                 return None
             return text
 
-    def _store_cached_result(self, symbol: str, text: str) -> None:
+    def _store_cached_result(self, cache_key: str, text: str) -> None:
         if self.cache_ttl <= 0:
             return
         with self._state_lock:
-            self._cache[symbol] = (time.monotonic() + self.cache_ttl, text)
+            self._cache[cache_key] = (time.monotonic() + self.cache_ttl, text)
+
+    def _prompt_cache_key(self, kind: str, prompt: str, search_enabled: bool) -> str:
+        payload = json.dumps(
+            {
+                "kind": kind,
+                "prompt_version": GEMINI_PROMPT_VERSION,
+                "model": self.model,
+                "fallback_model": self.fallback_model,
+                "thinking_level": self.thinking_level,
+                "search": bool(search_enabled),
+                "prompt": prompt,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return f"{kind}:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _quota_message() -> str:
@@ -2072,7 +2277,12 @@ class GeminiAnalyzer:
             search = "Google Search tắt"
         return f"đã bật ({self.model}, {self.thinking_level}, {search})"
 
-    def _build_prompt(self, signal: DeepSignal, allow_search: bool = True) -> str:
+    def _build_prompt(
+        self,
+        signal: DeepSignal,
+        allow_search: bool = True,
+        council_context: str = "",
+    ) -> str:
         snapshot = signal.snapshot
         quote = signal.quote
         closes = [bar.close for bar in signal.bars]
@@ -2082,6 +2292,7 @@ class GeminiAnalyzer:
         backtest_3m = signal.backtest_3m
         macro = signal.macro or MacroContext()
         capital = _capital_metrics(snapshot)
+        council_block = str(council_context or "").strip()[:4000]
 
         def prompt_billion(value: float | None) -> str:
             return "chưa có" if value is None else f"{value / 1_000_000_000:.2f} tỷ VND"
@@ -2148,6 +2359,13 @@ class GeminiAnalyzer:
             f"rủi ro={macro.risk_drivers}; chính sách={macro.policy_notes}; "
             f"confidence={macro.confidence}\n"
             f"Lý do lọc: {', '.join(signal.reasons)}\n\n"
+            + (
+                "Phản biện độc lập GLM/DeepSeek (dữ liệu tham khảo, không được sửa điểm):\n"
+                f"{council_block}\n\n"
+                if council_block
+                else ""
+            )
+            +
             "Trả lời tiếng Việt ngắn gọn theo đúng 5 mục, mỗi mục 1–2 câu: "
             "1) Chất lượng doanh nghiệp; 2) Định giá; 3) Mẫu hình và điều kiện xác nhận/hủy; "
             "4) Vĩ mô theo hai chiều tích cực-rủi ro; 5) Điều còn thiếu cần kiểm chứng. "
@@ -2263,8 +2481,9 @@ class GeminiAnalyzer:
         prompt: str,
         use_search: bool | None = None,
         model: str | None = None,
+        bypass_min_interval: bool = False,
     ) -> str:
-        self._reserve_request_slot()
+        self._reserve_request_slot(bypass_min_interval=bypass_min_interval)
         client = self._create_client()
         if use_search is None:
             use_search = self.use_google_search and time.monotonic() >= self._search_disabled_until
@@ -2289,8 +2508,12 @@ class GeminiAnalyzer:
         self._validate_neutral_language(text)
         return self._with_sources(text, sources)
 
-    def _analyze_legacy_fallback(self, prompt: str) -> str:
-        self._reserve_request_slot()
+    def _analyze_legacy_fallback(
+        self,
+        prompt: str,
+        bypass_min_interval: bool = False,
+    ) -> str:
+        self._reserve_request_slot(bypass_min_interval=bypass_min_interval)
         endpoint = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
             f"{url_quote(self.fallback_model, safe='')}:generateContent"
@@ -2322,21 +2545,35 @@ class GeminiAnalyzer:
         self._validate_neutral_language(text)
         return self._with_sources(text[:2200], [])
 
-    def analyze(self, signal: DeepSignal) -> str:
+    def analyze(
+        self,
+        signal: DeepSignal,
+        council_context: str = "",
+        allow_burst: bool = False,
+    ) -> str:
         if not self.enabled():
             return "Gemini chưa có API key; bot đang dùng phần chấm điểm định lượng."
 
-        cached = self._cached_result(signal.symbol)
+        search_attempted = self.use_google_search and time.monotonic() >= self._search_disabled_until
+        prompt = self._build_prompt(
+            signal,
+            allow_search=search_attempted,
+            council_context=council_context,
+        )
+        cache_key = self._prompt_cache_key("SIGNAL", prompt, search_attempted)
+        cached = self._cached_result(cache_key)
         if cached is not None:
             return cached + "\n\n(Kết quả Gemini được lấy từ cache để tiết kiệm quota.)"
         if self._quota_remaining() > 0:
             return self._quota_message()
 
-        search_attempted = self.use_google_search and time.monotonic() >= self._search_disabled_until
-        prompt = self._build_prompt(signal, allow_search=search_attempted)
         try:
-            result = self._analyze_interactions(prompt, use_search=search_attempted)
-            self._store_cached_result(signal.symbol, result)
+            result = self._analyze_interactions(
+                prompt,
+                use_search=search_attempted,
+                bypass_min_interval=allow_burst,
+            )
+            self._store_cached_result(cache_key, result)
             return result
         except GeminiRequestCooldown as cooldown_exc:
             return self._rate_message(cooldown_exc.remaining)
@@ -2364,22 +2601,31 @@ class GeminiAnalyzer:
 
         # One fallback only. A quota error never enters this route, preventing
         # the old retry cascade (Search -> no Search -> model -> REST).
-        offline_prompt = self._build_prompt(signal, allow_search=False)
+        offline_prompt = self._build_prompt(
+            signal,
+            allow_search=False,
+            council_context=council_context,
+        )
+        offline_cache_key = self._prompt_cache_key("SIGNAL", offline_prompt, False)
         try:
             if genai is None and self._client_factory is None:
-                fallback_text = self._analyze_legacy_fallback(offline_prompt)
+                fallback_text = self._analyze_legacy_fallback(
+                    offline_prompt,
+                    bypass_min_interval=True,
+                )
             else:
                 fallback_text = self._analyze_interactions(
                     offline_prompt,
                     use_search=False,
                     model=self.fallback_model,
+                    bypass_min_interval=True,
                 )
             suffix = (
                 "\n\n(Google Search không khả dụng; Gemini đang dùng model dự phòng "
                 "với dữ liệu định lượng.)"
             )
             result = fallback_text + suffix
-            self._store_cached_result(signal.symbol, result)
+            self._store_cached_result(offline_cache_key, result)
             return result
         except GeminiRequestCooldown as cooldown_exc:
             return self._rate_message(cooldown_exc.remaining)
@@ -2412,14 +2658,8 @@ class GeminiAnalyzer:
                 "Gemini chưa có API key; bot chỉ hiển thị tiêu đề có nguồn và "
                 "bối cảnh vĩ mô định lượng."
             )
-        cache_key = f"NEWS:{topic.casefold()}"
-        cached = self._cached_result(cache_key)
-        if cached is not None:
-            return cached + "\n\n(Kết quả được lấy từ cache để tiết kiệm quota.)"
-        if self._quota_remaining() > 0:
-            return self._quota_message()
         headline_lines = "\n".join(
-            f"- [{item.source}] {item.title} ({item.published_at or 'không rõ ngày'})"
+            f"- [{item.source}] {item.title} ({item.published_at or 'không rõ ngày'}; {item.url})"
             for item in items
         ) or "- Không có tiêu đề phù hợp từ RSS."
         prompt = (
@@ -2440,6 +2680,12 @@ class GeminiAnalyzer:
             "3) Kênh tác động tiêu cực/rủi ro; 4) Điều cần mở văn bản gốc hoặc công bố "
             "doanh nghiệp để kiểm chứng. Không thêm danh sách nguồn vì hệ thống tự gắn."
         )
+        cache_key = self._prompt_cache_key("NEWS", prompt, False)
+        cached = self._cached_result(cache_key)
+        if cached is not None:
+            return cached + "\n\n(Kết quả được lấy từ cache để tiết kiệm quota.)"
+        if self._quota_remaining() > 0:
+            return self._quota_message()
         try:
             result = self._analyze_interactions(prompt, use_search=False)
             self._store_cached_result(cache_key, result)
@@ -2572,7 +2818,15 @@ def build_score_breakdown(
     """Score five auditable dimensions; missing data receives neutral/low points."""
 
     reasons: list[str] = []
-    price = snapshot.price or quote.price
+    # A single as-of price must drive technical scoring and the trade plan.
+    # TradingView's batch close can be older than the quote used for execution.
+    price = quote.price
+    if (
+        snapshot.price is not None
+        and quote.price > 0
+        and abs(snapshot.price / quote.price - 1.0) > 0.03
+    ):
+        reasons.append("giá TradingView lệch quá 3% so với quote; dùng quote mới hơn")
 
     # 1) Business quality: 30 points.
     revenue_growth = snapshot.revenue_growth
@@ -2638,6 +2892,9 @@ def build_score_breakdown(
         current = snapshot.current_ratio
         if debt is None:
             debt_points = 2
+        elif debt < 0:
+            debt_points = 0
+            reasons.append("D/E âm cần kiểm tra vốn chủ sở hữu")
         elif debt < 0.5:
             debt_points = 5
         elif debt < 1.0:
@@ -2663,19 +2920,28 @@ def build_score_breakdown(
         revenue_points + profit_points + roe_points + balance_points,
         30,
     )
+    cashflow_penalty = 0
     if snapshot.operating_cash_flow is not None and snapshot.operating_cash_flow < 0:
         reasons.append(
             f"CFO TTM âm {format_vnd_billions(snapshot.operating_cash_flow)} VND"
         )
+        if not is_financial:
+            cashflow_penalty += 2
     if snapshot.free_cash_flow is not None and snapshot.free_cash_flow < 0:
         reasons.append(
             f"FCF TTM âm {format_vnd_billions(snapshot.free_cash_flow)} VND"
         )
+        if not is_financial:
+            cashflow_penalty += 1
+    business = max(0, business - cashflow_penalty)
 
     # 2) Valuation: 25 points.
     pe = snapshot.trailing_pe
     if pe is None:
         pe_points = 5
+    elif pe <= 0:
+        pe_points = 0
+        reasons.append("P/E không có ý nghĩa do lợi nhuận không dương")
     elif 0 < pe <= 8:
         pe_points = 12
         reasons.append(f"P/E thấp {pe:.2f}")
@@ -2689,12 +2955,13 @@ def build_score_breakdown(
         pe_points = 2
     else:
         pe_points = 0
-        if pe <= 0:
-            reasons.append("P/E không có ý nghĩa do lợi nhuận không dương")
 
     pb = snapshot.price_to_book
     if pb is None:
         pb_points = 3
+    elif pb <= 0:
+        pb_points = 0
+        reasons.append("P/B không có ý nghĩa do vốn chủ sở hữu không dương")
     elif 0 < pb <= 1:
         pb_points = 8
         reasons.append(f"P/B thấp {pb:.2f}")
@@ -2723,6 +2990,33 @@ def build_score_breakdown(
     else:
         growth_points = 2 if growth_for_peg is None else 0
     valuation = _clamp_points(pe_points + pb_points + growth_points, 25)
+
+    # Missing core inputs reduce confidence instead of silently receiving a
+    # fully neutral score. This is deliberately small and auditable.
+    quality_values: list[float | None] = [
+        revenue_growth,
+        profit_growth,
+        roe,
+        pe,
+        pb,
+    ]
+    if not is_financial:
+        quality_values.extend([snapshot.debt_to_equity, snapshot.current_ratio])
+    available_fields = sum(value is not None for value in quality_values)
+    data_quality = int(round(available_fields / len(quality_values) * 100))
+    if data_quality < 50:
+        confidence_penalty = 5
+    elif data_quality < 70:
+        confidence_penalty = 3
+    elif data_quality < 85:
+        confidence_penalty = 1
+    else:
+        confidence_penalty = 0
+    if confidence_penalty:
+        business = max(0, business - confidence_penalty)
+        reasons.append(
+            f"dữ liệu lõi chỉ đủ {data_quality}%; trừ {confidence_penalty} điểm tin cậy"
+        )
 
     # 3) Trend, momentum, pattern, and volume: 25 points.
     pattern, profile = _technical_profile(bars, price)
@@ -2773,9 +3067,10 @@ def build_score_breakdown(
 
     # 4) Volatility and liquidity risk: 10 points.
     closes = [bar.close for bar in bars]
+    risk_closes = closes[-61:]
     returns = [
         current / previous - 1.0
-        for previous, current in zip(closes[:-1], closes[1:])
+        for previous, current in zip(risk_closes[:-1], risk_closes[1:])
         if previous > 0
     ]
     if len(returns) >= 20:
@@ -2832,6 +3127,9 @@ def build_score_breakdown(
         macro=macro_points,
         total=_clamp_points(total, 100),
         pattern=pattern,
+        data_quality=data_quality,
+        confidence_penalty=confidence_penalty,
+        version=SCORE_VERSION,
     )
     if not reasons:
         reasons.append("dữ liệu hiện tại chưa tạo ra điểm nổi bật")
@@ -2881,10 +3179,16 @@ def build_trade_plan(quote: Quote, bars: list[PriceBar]) -> TradePlan:
     )
 
 
-def _market_signature(closes: list[float], index: int) -> tuple[int, int] | None:
+def _market_signature(
+    bars: list[PriceBar],
+    index: int,
+    closes: list[float] | None = None,
+) -> tuple[int, int, int, int] | None:
+    """Point-in-time regime signature built only from bars available at index."""
+
     if index < 50:
         return None
-    segment = closes[: index + 1]
+    closes = closes if closes is not None else [bar.close for bar in bars]
     price = closes[index]
     ma20 = sum(closes[index - 19 : index + 1]) / 20
     ma50 = sum(closes[index - 49 : index + 1]) / 50
@@ -2899,7 +3203,7 @@ def _market_signature(closes: list[float], index: int) -> tuple[int, int] | None
         trend_state = -1
     else:
         trend_state = 0
-    current_rsi = rsi(segment, 14)
+    current_rsi = rsi(closes[max(0, index - 20) : index + 1], 14)
     if current_rsi is None:
         rsi_bucket = 1
     elif current_rsi < 35:
@@ -2908,18 +3212,103 @@ def _market_signature(closes: list[float], index: int) -> tuple[int, int] | None
         rsi_bucket = 1
     else:
         rsi_bucket = 2
-    return trend_state, rsi_bucket
+
+    recent_returns = [
+        current / previous - 1.0
+        for previous, current in zip(
+            closes[max(0, index - 20) : index],
+            closes[max(1, index - 19) : index + 1],
+        )
+        if previous > 0
+    ]
+    if len(recent_returns) < 10:
+        volatility_bucket = 1
+    else:
+        mean_return = sum(recent_returns) / len(recent_returns)
+        variance = sum(
+            (item - mean_return) ** 2 for item in recent_returns
+        ) / len(recent_returns)
+        annualized = math.sqrt(variance) * math.sqrt(252) * 100
+        volatility_bucket = 0 if annualized <= 30 else (1 if annualized <= 50 else 2)
+
+    prior_volumes = [
+        float(bar.volume)
+        for bar in bars[max(0, index - 20) : index]
+        if bar.volume is not None and bar.volume > 0
+    ]
+    current_volume = bars[index].volume
+    if current_volume is None or not prior_volumes:
+        volume_bucket = 1
+    else:
+        volume_ratio = float(current_volume) / (sum(prior_volumes) / len(prior_volumes))
+        volume_bucket = 0 if volume_ratio < 0.8 else (1 if volume_ratio <= 1.2 else 2)
+    return trend_state, rsi_bucket, volatility_bucket, volume_bucket
+
+
+def _similar_signature(
+    candidate: tuple[int, int, int, int] | None,
+    current: tuple[int, int, int, int] | None,
+) -> bool:
+    if candidate is None or current is None:
+        return False
+    # Trend and momentum must match. At least one risk/liquidity regime must
+    # also match so the comparison is richer without making samples vanish.
+    return (
+        candidate[0] == current[0]
+        and candidate[1] == current[1]
+        and (candidate[2] == current[2] or candidate[3] == current[3])
+    )
+
+
+def _wilson_lower_percent(wins: int, trials: int, z: float = 1.96) -> float | None:
+    if trials <= 0:
+        return None
+    proportion = wins / trials
+    denominator = 1.0 + z * z / trials
+    centre = proportion + z * z / (2.0 * trials)
+    margin = z * math.sqrt(
+        proportion * (1.0 - proportion) / trials + z * z / (4.0 * trials * trials)
+    )
+    return max(0.0, (centre - margin) / denominator * 100.0)
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
 
 
 def backtest_similar_patterns(
     bars: list[PriceBar],
     plan: TradePlan,
     lookahead_sessions: int = 20,
+    *,
+    round_trip_cost_pct: float = DEFAULT_BACKTEST_COST_PCT,
+    min_spacing: int | None = None,
+    max_samples: int = 40,
+    max_entry_sessions: int = 3,
 ) -> BacktestResult:
-    """Test T1-before-stop on similar trend/RSI states, conservatively."""
+    """Causal, non-overlapping simulation of T1-before-stop.
 
-    closes = [bar.close for bar in bars]
-    if len(closes) < 80 or plan.risk_pct <= 0:
+    Signals are formed after a close and wait up to ``max_entry_sessions`` for
+    an open inside the displayed entry zone. ATR/support and all price levels
+    use only facts known at the historical signal date. Daily ambiguity is
+    resolved stop-first and all reported returns include configured friction.
+    """
+
+    history = _chronological_bars(bars)
+    lookahead_sessions = max(1, int(lookahead_sessions))
+    max_entry_sessions = max(1, min(int(max_entry_sessions), 10))
+    full_window = lookahead_sessions + max_entry_sessions
+    spacing = max(full_window, int(min_spacing or full_window))
+    max_samples = max(1, min(int(max_samples), 200))
+    cost_pct = max(0.0, min(float(round_trip_cost_pct), 10.0))
+
+    def empty_result() -> BacktestResult:
         return BacktestResult(
             samples=0,
             wins=0,
@@ -2927,36 +3316,89 @@ def backtest_similar_patterns(
             unresolved=0,
             hit_rate=None,
             lookahead_sessions=lookahead_sessions,
+            cost_pct=cost_pct,
         )
-    current_signature = _market_signature(closes, len(closes) - 1)
+
+    if len(history) < max(80, full_window + 52) or plan.risk_pct <= 0:
+        return empty_result()
+    closes = [bar.close for bar in history]
+    current_signature = _market_signature(history, len(history) - 1, closes)
     if current_signature is None:
-        return BacktestResult(
-            samples=0,
-            wins=0,
-            losses=0,
-            unresolved=0,
-            hit_rate=None,
-            lookahead_sessions=lookahead_sessions,
-        )
+        return empty_result()
+
     candidate_indices: list[int] = []
-    last_possible = len(closes) - lookahead_sessions - 1
+    last_possible = len(history) - lookahead_sessions - max_entry_sessions
     for index in range(50, max(50, last_possible + 1)):
-        if _market_signature(closes, index) == current_signature:
+        if _similar_signature(
+            _market_signature(history, index, closes),
+            current_signature,
+        ):
             candidate_indices.append(index)
-    candidate_indices = candidate_indices[-40:]
-    risk_ratio = plan.risk_pct / 100.0
+
+    # Select newest observations backwards while imposing an embargo equal to
+    # the outcome horizon. Their forward windows therefore never overlap.
+    selected_reversed: list[int] = []
+    for index in reversed(candidate_indices):
+        if selected_reversed and selected_reversed[-1] - index < spacing:
+            continue
+        selected_reversed.append(index)
+        if len(selected_reversed) >= max_samples:
+            break
+    candidate_indices = list(reversed(selected_reversed))
+
     wins = 0
     losses = 0
     unresolved = 0
-    holding_returns: list[float] = []
+    not_filled = 0
+    net_returns: list[float] = []
+    r_multiples: list[float] = []
     for index in candidate_indices:
-        entry = closes[index]
-        exit_price = closes[index + lookahead_sessions]
-        holding_returns.append((exit_price / entry - 1.0) * 100.0)
-        target = entry * (1.0 + risk_ratio)
-        stop = entry * (1.0 - risk_ratio)
+        signal_close = history[index].close
+        previous_close = history[index - 1].close if index > 0 else signal_close
+        historical_quote = Quote("BACKTEST", "BACKTEST", signal_close, previous_close)
+        historical_plan = build_trade_plan(historical_quote, history[: index + 1])
+        target = historical_plan.target_1
+        stop = historical_plan.stop
+        planned_risk = signal_close - stop
+        entry_index: int | None = None
+        entry = 0.0
+        for possible_index in range(index + 1, index + 1 + max_entry_sessions):
+            possible_bar = history[possible_index]
+            opening = possible_bar.open_price
+            # The policy is explicitly next-open. Substituting the same day's
+            # close when open is missing leaks future information into entry.
+            if opening is None or not math.isfinite(opening) or opening <= 0:
+                continue
+            if (
+                historical_plan.entry_low <= opening <= historical_plan.entry_high
+                and stop < opening < target
+            ):
+                entry_index = possible_index
+                entry = opening
+                break
+        if entry_index is None or entry <= 0 or planned_risk <= 0:
+            unresolved += 1
+            not_filled += 1
+            continue
         outcome = ""
-        for bar in bars[index + 1 : index + 1 + lookahead_sessions]:
+        exit_index = entry_index + lookahead_sessions - 1
+        exit_price = history[exit_index].close
+        for bar in history[entry_index : entry_index + lookahead_sessions]:
+            opening = bar.open_price
+            valid_open = (
+                opening is not None
+                and math.isfinite(opening)
+                and opening > 0
+            )
+            if valid_open and opening <= stop:
+                outcome = "loss"
+                exit_price = opening
+                break
+            if valid_open and opening >= target:
+                outcome = "win"
+                # Do not grant favorable slippage on a gap through T1.
+                exit_price = target
+                break
             high = bar.high if bar.high is not None else bar.close
             low = bar.low if bar.low is not None else bar.close
             hit_target = high >= target
@@ -2964,9 +3406,11 @@ def backtest_similar_patterns(
             if hit_stop:
                 # If both are touched in one daily candle, count the stop first.
                 outcome = "loss"
+                exit_price = stop
                 break
             if hit_target:
                 outcome = "win"
+                exit_price = target
                 break
         if outcome == "win":
             wins += 1
@@ -2974,24 +3418,22 @@ def backtest_similar_patterns(
             losses += 1
         else:
             unresolved += 1
+        net_return = (exit_price / entry - 1.0) * 100.0 - cost_pct
+        net_returns.append(net_return)
+        net_pnl_per_share = exit_price - entry - entry * cost_pct / 100.0
+        r_multiples.append(net_pnl_per_share / planned_risk)
+
     resolved = wins + losses
     hit_rate = wins / resolved * 100 if resolved >= 5 else None
-    positive_closes = sum(1 for item in holding_returns if item > 0)
+    hit_rate_lower = _wilson_lower_percent(wins, resolved) if resolved >= 5 else None
+    positive_closes = sum(1 for item in net_returns if item > 0)
     positive_close_rate = (
-        positive_closes / len(holding_returns) * 100
-        if len(holding_returns) >= 5
+        positive_closes / len(net_returns) * 100
+        if len(net_returns) >= 5
         else None
     )
-    median_return = None
-    if holding_returns:
-        ordered_returns = sorted(holding_returns)
-        middle = len(ordered_returns) // 2
-        if len(ordered_returns) % 2:
-            median_return = ordered_returns[middle]
-        else:
-            median_return = (
-                ordered_returns[middle - 1] + ordered_returns[middle]
-            ) / 2.0
+    median_return = _median(net_returns)
+    expected_r = sum(r_multiples) / len(r_multiples) if len(r_multiples) >= 5 else None
     return BacktestResult(
         samples=len(candidate_indices),
         wins=wins,
@@ -3002,6 +3444,18 @@ def backtest_similar_patterns(
         positive_close_rate=positive_close_rate,
         median_return=median_return,
         lookahead_sessions=lookahead_sessions,
+        resolved=resolved,
+        effective_samples=len(candidate_indices),
+        hit_rate_lower=hit_rate_lower,
+        expected_r=expected_r,
+        median_net_return=median_return,
+        cost_pct=cost_pct,
+        entry_policy=f"next-open-in-zone-{max_entry_sessions}",
+        sample_indices=tuple(candidate_indices),
+        sample_dates=tuple(
+            history[index].date or f"index:{index}" for index in candidate_indices
+        ),
+        not_filled=not_filled,
     )
 
 
@@ -3011,11 +3465,23 @@ def build_deep_signal(
     quote: Quote,
     bars: list[PriceBar],
     macro: MacroContext | None = None,
+    *,
+    backtest_cost_pct: float = DEFAULT_BACKTEST_COST_PCT,
 ) -> DeepSignal:
     breakdown, reasons = build_score_breakdown(snapshot, quote, bars, macro)
     plan = build_trade_plan(quote, bars)
-    backtest = backtest_similar_patterns(bars, plan, 20)
-    backtest_3m = backtest_similar_patterns(bars, plan, 60)
+    backtest = backtest_similar_patterns(
+        bars,
+        plan,
+        20,
+        round_trip_cost_pct=backtest_cost_pct,
+    )
+    backtest_3m = backtest_similar_patterns(
+        bars,
+        plan,
+        60,
+        round_trip_cost_pct=backtest_cost_pct,
+    )
     return DeepSignal(
         symbol=symbol,
         score=breakdown.total,
@@ -3062,20 +3528,28 @@ def _compose_telegram_html(
 def _format_backtest_horizon(label: str, result: BacktestResult) -> str:
     if result.samples == 0:
         return f"{label}: chưa có đủ lịch sử phù hợp."
-    resolved = result.wins + result.losses
+    resolved = result.resolved or (result.wins + result.losses)
+    trade_timeouts = max(0, result.unresolved - result.not_filled)
     if result.hit_rate is None:
         target_text = (
             f"T1 trước stop: chưa đủ mẫu kết luận "
-            f"({result.wins} đạt/{result.losses} dừng/{result.unresolved} chưa ngã ngũ)"
+            f"({result.wins} đạt/{result.losses} dừng/{trade_timeouts} timeout; "
+            f"{result.not_filled} không khớp entry)"
         )
     else:
+        lower_text = (
+            f"; cận dưới Wilson 95% {result.hit_rate_lower:.1f}%"
+            if result.hit_rate_lower is not None
+            else ""
+        )
         target_text = (
             f"T1 trước stop {result.hit_rate:.1f}% "
             f"({result.wins}/{resolved} mẫu đã ngã ngũ; "
-            f"{result.unresolved} chưa ngã ngũ)"
+            f"{trade_timeouts} timeout, {result.not_filled} không khớp entry"
+            f"{lower_text})"
         )
     if result.positive_close_rate is None:
-        holding_text = "giá cuối kỳ dương: chưa đủ mẫu"
+        holding_text = "lợi nhuận ròng dương: chưa đủ mẫu"
     else:
         median_text = (
             f"{result.median_return:+.1f}%"
@@ -3083,14 +3557,27 @@ def _format_backtest_horizon(label: str, result: BacktestResult) -> str:
             else "—"
         )
         holding_text = (
-            f"giá cuối kỳ dương {result.positive_close_rate:.1f}% "
+            f"giao dịch ròng dương {result.positive_close_rate:.1f}% "
             f"({result.positive_closes}/{result.samples}); "
-            f"lợi nhuận trung vị {median_text}"
+            f"lợi nhuận trung vị sau phí {median_text}"
         )
-    return f"{label}: {target_text}; {holding_text}."
+    expectancy_text = (
+        f"; kỳ vọng {result.expected_r:+.2f}R"
+        if result.expected_r is not None
+        else ""
+    )
+    return (
+        f"{label}: {target_text}; {holding_text}{expectancy_text}; "
+        f"{result.effective_samples or result.samples} mẫu hiệu dụng không chồng lấn, "
+        f"{max(0, result.samples - result.not_filled)}/{result.samples} khớp entry."
+    )
 
 
-def format_deep_signal(signal: DeepSignal, gemini_text: str) -> str:
+def format_deep_signal(
+    signal: DeepSignal,
+    gemini_text: str,
+    council_text: str = "",
+) -> str:
     snapshot = signal.snapshot
     price = snapshot.price or signal.quote.price
     breakdown = signal.breakdown
@@ -3128,6 +3615,20 @@ def format_deep_signal(signal: DeepSignal, gemini_text: str) -> str:
     driver_line = "; ".join(drivers) if drivers else macro.summary
     reasons = "; ".join(signal.reasons[:7])
     capital_html = _capital_snapshot_html(snapshot)
+    latest_bar = signal.bars[-1] if signal.bars else None
+    market_data_line = (
+        f"OHLCV: {latest_bar.source or 'chưa rõ nguồn'} · phiên "
+        f"{latest_bar.date or 'chưa rõ ngày'} · "
+        f"{'chuỗi có điều chỉnh' if any(bar.adjusted for bar in signal.bars) else 'không có cờ điều chỉnh'}"
+        if latest_bar is not None
+        else "OHLCV: chưa có lịch sử"
+    )
+    council_section = (
+        "<b>5) Phản biện GLM/DeepSeek (shadow)</b>\n"
+        f"{html.escape(_plain_excerpt(council_text, 900))}\n\n"
+        if council_text
+        else ""
+    )
     prefix = (
         f"<b>DEEP 100 điểm: {html.escape(signal.symbol)}</b>\n"
         f"{html.escape(snapshot.name)}"
@@ -3136,6 +3637,8 @@ def format_deep_signal(signal: DeepSignal, gemini_text: str) -> str:
         f"DN {breakdown.business}/30 · Định giá {breakdown.valuation}/25 · "
         f"Kỹ thuật {breakdown.technical}/25 · Rủi ro {breakdown.risk}/10 · "
         f"Vĩ mô {breakdown.macro}/10\n\n"
+        f"Độ đầy đủ dữ liệu lõi: {breakdown.data_quality}% · phiên bản điểm {breakdown.version}\n\n"
+        f"{html.escape(market_data_line)}\n\n"
         "<b>1) Doanh nghiệp &amp; định giá</b>\n"
         f"Giá: <b>{format_number(price)}</b> VND | "
         f"P/E {format_number(snapshot.trailing_pe)} | P/B {format_number(snapshot.price_to_book)}\n"
@@ -3155,12 +3658,15 @@ def format_deep_signal(signal: DeepSignal, gemini_text: str) -> str:
         "<b>3) Thống kê mẫu hình lịch sử</b>\n"
         f"{html.escape(backtest_1m_line)}\n"
         f"{html.escape(backtest_3m_line)}\n"
-        "T1/stop dùng cùng tỷ lệ rủi ro hiện tại; cùng nến chạm cả hai được tính là stop.\n\n"
+        f"Mô phỏng chờ tối đa 3 next-open trong vùng entry, ATR lịch sử, "
+        f"phí/trượt giá {backtest.cost_pct:.2f}%; "
+        "mẫu cách nhau tối thiểu bằng horizon, cùng nến chạm cả hai tính stop.\n\n"
         "<b>4) Bối cảnh vĩ mô trung lập</b>\n"
         f"{html.escape(macro.stance)} (điểm vimo-VN {macro_score}) — "
         f"{html.escape(_plain_excerpt(driver_line, 420))}"
         f"{source_line}\n\n"
         f"<b>Điểm cần chú ý:</b> {html.escape(_plain_excerpt(reasons, 520))}\n\n"
+        f"{council_section}"
         "<b>Góc nhìn Gemini:</b>\n"
     )
     suffix = (
@@ -3230,6 +3736,64 @@ def format_news_report(
     )
 
 
+def _council_evidence(signal: DeepSignal) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Build one immutable, JSON-safe packet shared by both analysts."""
+
+    breakdown = signal.breakdown
+    plan = signal.trade_plan
+    evidence_by_id: dict[str, Any] = {
+        "quote": asdict(signal.quote),
+        "fundamentals": asdict(signal.snapshot),
+        "technicals": {
+            "pattern": breakdown.pattern if breakdown is not None else None,
+            "bars": [asdict(bar) for bar in signal.bars[-60:]],
+        },
+        "score": {
+            "score": signal.score,
+            "breakdown": asdict(breakdown) if breakdown is not None else None,
+            "reasons": list(signal.reasons),
+        },
+        "trade_plan": asdict(plan) if plan is not None else None,
+        "backtest_20": asdict(signal.backtest) if signal.backtest is not None else None,
+        "backtest_60": asdict(signal.backtest_3m) if signal.backtest_3m is not None else None,
+        "macro": asdict(signal.macro) if signal.macro is not None else None,
+    }
+    evidence_ids = tuple(evidence_by_id)
+    return (
+        {
+            "scenario": {
+                "symbol": signal.symbol,
+                "score_version": breakdown.version if breakdown is not None else SCORE_VERSION,
+                "purpose": "challenge a quant-filtered research candidate",
+                "not_a_trade_decision": True,
+            },
+            "evidence_by_id": evidence_by_id,
+        },
+        evidence_ids,
+    )
+
+
+def _format_council_shadow(report: CouncilReport | None) -> str:
+    if report is None or not report.enabled:
+        return ""
+    labels = {"glm": "GLM cơ bản", "deepseek": "DeepSeek phản biện"}
+    lines = [f"Council shadow: {report.status} (không sửa quyết định quant)."]
+    for review in report.reviews:
+        opinion = review.opinion
+        detail = (
+            f"{labels.get(review.provider, review.provider)} — {review.status}/"
+            f"{opinion.verdict}, tự tin nội bộ {opinion.confidence:.0%}: "
+            f"{opinion.summary}"
+        )
+        if opinion.risks:
+            detail += f" Rủi ro: {opinion.risks[0]}"
+        if opinion.missing_data:
+            detail += f" Thiếu: {opinion.missing_data[0]}"
+        lines.append(detail)
+    lines.append("Độ tự tin model ở trên không phải xác suất thắng.")
+    return _plain_excerpt("\n".join(lines), 1800)
+
+
 class DeepSignalScanner:
     """Scan VN100 and emit at most a few high-conviction discount signals."""
 
@@ -3242,6 +3806,16 @@ class DeepSignalScanner:
         min_score: int = 70,
         max_per_scan: int = 2,
         max_workers: int = DEFAULT_SCAN_WORKERS,
+        require_backtest: bool = False,
+        min_backtest_resolved: int = DEFAULT_MIN_BACKTEST_RESOLVED,
+        min_backtest_win_lower: float = DEFAULT_MIN_BACKTEST_WIN_LOWER,
+        min_backtest_expectancy_r: float = DEFAULT_MIN_BACKTEST_EXPECTANCY_R,
+        min_backtest_fill_rate: float = DEFAULT_MIN_BACKTEST_FILL_RATE,
+        backtest_cost_pct: float = DEFAULT_BACKTEST_COST_PCT,
+        council: ModelCouncil | None = None,
+        council_usage_store: ApiUsageStore | None = None,
+        require_dated_history: bool = False,
+        max_history_staleness_days: int = DEFAULT_MAX_HISTORY_STALENESS_DAYS,
     ):
         self.provider = provider
         self.gemini = gemini
@@ -3250,6 +3824,18 @@ class DeepSignalScanner:
         self.min_score = min_score
         self.max_per_scan = max_per_scan
         self.max_workers = max(1, min(int(max_workers), 12))
+        self.require_backtest = bool(require_backtest)
+        self.min_backtest_resolved = max(1, int(min_backtest_resolved))
+        self.min_backtest_win_lower = max(0.0, min(float(min_backtest_win_lower), 100.0))
+        self.min_backtest_expectancy_r = float(min_backtest_expectancy_r)
+        self.min_backtest_fill_rate = max(0.0, min(float(min_backtest_fill_rate), 100.0))
+        self.backtest_cost_pct = max(0.0, float(backtest_cost_pct))
+        self.council = council
+        self.council_usage_store = council_usage_store
+        self.require_dated_history = bool(require_dated_history)
+        self.max_history_staleness_days = max(1, int(max_history_staleness_days))
+        self._council_reports: dict[str, CouncilReport] = {}
+        self._council_lock = threading.Lock()
 
     @staticmethod
     def _fundamental_ceiling(snapshot: FundamentalSnapshot) -> int:
@@ -3268,11 +3854,66 @@ class DeepSignalScanner:
         macro: MacroContext | None,
     ) -> DeepSignal | None:
         quote = self.provider.get_quote(symbol)
-        bars = self.provider.get_history(symbol, range_value="1y", interval="1d")
-        signal = build_deep_signal(symbol, snapshot, quote, bars, macro)
+        bars = self.provider.get_history(symbol, range_value="5y", interval="1d")
+        if self.require_dated_history:
+            try:
+                trading_days = [date.fromisoformat(str(bar.date)) for bar in bars]
+                if (
+                    not trading_days
+                    or len(set(trading_days)) != len(trading_days)
+                    or trading_days != sorted(trading_days)
+                ):
+                    raise ValueError("OHLCV dates are missing, duplicate, or unsorted")
+                latest_day = trading_days[-1]
+                age_days = (datetime.now().date() - latest_day).days
+            except (TypeError, ValueError):
+                LOG.info("Skipping %s: OHLCV dates are missing/duplicate/unsorted", symbol)
+                return None
+            if age_days < -1 or age_days > self.max_history_staleness_days:
+                LOG.info(
+                    "Skipping %s: latest OHLCV is %s days old",
+                    symbol,
+                    age_days,
+                )
+                return None
+        signal = build_deep_signal(
+            symbol,
+            snapshot,
+            quote,
+            bars,
+            macro,
+            backtest_cost_pct=self.backtest_cost_pct,
+        )
         if signal.score < self.min_score:
             return None
+        if self.require_backtest:
+            result = signal.backtest
+            resolved = result.resolved if result is not None else 0
+            fill_rate = (
+                (result.samples - result.not_filled) / result.samples * 100.0
+                if result is not None and result.samples > 0
+                else 0.0
+            )
+            if (
+                result is None
+                or resolved < self.min_backtest_resolved
+                or result.hit_rate_lower is None
+                or result.hit_rate_lower < self.min_backtest_win_lower
+                or result.expected_r is None
+                or result.expected_r < self.min_backtest_expectancy_r
+                or fill_rate < self.min_backtest_fill_rate
+            ):
+                return None
         return signal
+
+    @staticmethod
+    def _rank_key(signal: DeepSignal) -> tuple[float, float, int]:
+        result = signal.backtest
+        return (
+            result.hit_rate_lower if result and result.hit_rate_lower is not None else -1.0,
+            result.expected_r if result and result.expected_r is not None else -100.0,
+            signal.score,
+        )
 
     def find_candidates(self) -> list[DeepSignal]:
         batch_getter = getattr(self.provider, "get_fundamentals_batch", None)
@@ -3317,10 +3958,79 @@ class DeepSignalScanner:
                     continue
                 if candidate is not None:
                     candidates.append(candidate)
-        return sorted(candidates, key=lambda item: item.score, reverse=True)[: self.max_per_scan]
+        return sorted(candidates, key=self._rank_key, reverse=True)[: self.max_per_scan]
 
-    def render_signal(self, signal: DeepSignal) -> str:
-        return format_deep_signal(signal, self.gemini.analyze(signal))
+    def reviews_for(self, symbol: str) -> list[dict[str, Any]]:
+        with self._council_lock:
+            report = self._council_reports.get(symbol.upper())
+        if report is None:
+            return []
+        reviews: list[dict[str, Any]] = []
+        for review in report.reviews:
+            payload = review.to_dict()
+            payload.update(
+                {
+                    "council_schema_version": report.schema_version,
+                    "council_status": report.status,
+                    "council_fingerprint": report.fingerprint,
+                    "cache_hit": report.cache_hit,
+                }
+            )
+            reviews.append(payload)
+        return reviews
+
+    def council_status_text(self) -> str:
+        if self.council is None or not self.council.enabled:
+            return "tắt/chưa đủ hai API key"
+        return "bật shadow-only (GLM + DeepSeek)"
+
+    def render_signal(self, signal: DeepSignal, allow_burst: bool = False) -> str:
+        report: CouncilReport | None = None
+        council_context = ""
+        council_text = ""
+        with self._council_lock:
+            self._council_reports.pop(signal.symbol.upper(), None)
+        if self.council is not None and self.council.enabled:
+            try:
+                allowed = True
+                if self.council_usage_store is not None:
+                    allowed, used, limit = self.council_usage_store.claim("council_reviews")
+                    if not allowed:
+                        council_text = (
+                            f"Council shadow đã dùng {used}/{limit} lượt trong ngân sách an toàn hôm nay; "
+                            "giữ nguyên kết quả quant-only."
+                        )
+                if allowed:
+                    evidence, evidence_ids = _council_evidence(signal)
+                    report = self.council.review(evidence, evidence_ids=evidence_ids)
+                    with self._council_lock:
+                        self._council_reports[signal.symbol.upper()] = report
+                    council_payload = report.to_dict()
+                    council_payload.pop("cache_hit", None)
+                    council_context = json.dumps(
+                        council_payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    council_text = _format_council_shadow(report)
+            except (ValueError, TypeError) as exc:
+                LOG.warning("Model council skipped %s: %s", signal.symbol, exc)
+            except Exception as exc:
+                LOG.warning(
+                    "Model council failed safely for %s: %s",
+                    signal.symbol,
+                    type(exc).__name__,
+                )
+        return format_deep_signal(
+            signal,
+            self.gemini.analyze(
+                signal,
+                council_context=council_context,
+                allow_burst=allow_burst,
+            ),
+            council_text=council_text,
+        )
 
 
 def split_telegram_html(text: str, limit: int = 4090) -> list[str]:
@@ -3451,6 +4161,7 @@ HELP = (
     "/watchlist — xem danh sách đã lưu\n"
     "/watch — lấy giá toàn bộ danh sách\n"
     "/usage — xem phần trăm ngân sách API trong ngày\n"
+    "/performance — kết quả live đã ghi sổ: win/loss/timeout và expectancy\n"
     "/ping — kiểm tra bot\n\n"
     "Ví dụ: <code>/quote VNM</code>\n"
     "Bạn cũng có thể gõ trực tiếp <code>FPT</code> hoặc <code>VNM</code>."
@@ -3561,6 +4272,9 @@ class BotApplication:
         monthly_signal_limit: int = DEFAULT_MONTHLY_SIGNAL_LIMIT,
         signal_cooldown_days: int = DEFAULT_SIGNAL_COOLDOWN_DAYS,
         research_command_cooldown: float = DEFAULT_RESEARCH_COMMAND_COOLDOWN,
+        outcome_ledger: SignalLedger | None = None,
+        outcome_timeout_sessions: int = 20,
+        outcome_cost_bps: float = DEFAULT_BACKTEST_COST_PCT * 100.0,
     ):
         self.telegram = telegram
         self.provider = provider
@@ -3573,6 +4287,9 @@ class BotApplication:
         self.monthly_signal_limit = monthly_signal_limit
         self.signal_cooldown_days = signal_cooldown_days
         self.research_command_cooldown = max(0.0, float(research_command_cooldown))
+        self.outcome_ledger = outcome_ledger
+        self.outcome_timeout_sessions = max(1, int(outcome_timeout_sessions))
+        self.outcome_cost_bps = max(0.0, float(outcome_cost_bps))
         self._research_last_started_at = 0.0
         self._research_lock = threading.Lock()
 
@@ -3588,6 +4305,13 @@ class BotApplication:
                 return max(1, int(remaining) + 1)
             self._research_last_started_at = now
             return 0
+
+    def _scanner_council_status(self) -> str:
+        getter = getattr(self.scanner, "council_status_text", None)
+        if not callable(getter):
+            return "chưa cấu hình"
+        value = getter()
+        return value if isinstance(value, str) else "chưa cấu hình"
 
     @staticmethod
     def _research_cooldown_message(remaining: int) -> str:
@@ -3606,6 +4330,90 @@ class BotApplication:
             f"{label} đã dùng {used}/{limit} lượt (100%) trong ngày. "
             "Hãy chờ đến 00:00 (UTC+7) hoặc dùng /usage để xem trạng thái."
         )
+
+    def _refresh_live_outcomes(self) -> None:
+        if self.outcome_ledger is None:
+            return
+        open_records = self.outcome_ledger.list_signals(status="open")
+        histories: dict[str, list[dict[str, Any]]] = {}
+        for symbol in sorted({str(item["symbol"]) for item in open_records}):
+            try:
+                bars = self.provider.get_history(symbol, range_value="1y", interval="1d")
+                if bars and all(bar.date for bar in bars):
+                    histories[symbol] = _ledger_price_bars(bars)
+                else:
+                    LOG.warning("Outcome ledger skipped undated history for %s", symbol)
+            except (BotError, ValueError) as exc:
+                LOG.warning("Cannot refresh live outcome for %s: %s", symbol, exc)
+        if not histories:
+            return
+        # Isolate provider/data errors by signal. One malformed history must not
+        # prevent every other open record from settling in the same refresh.
+        for record in open_records:
+            symbol = str(record["symbol"])
+            bars = histories.get(symbol)
+            if bars is None:
+                continue
+            try:
+                self.outcome_ledger.update_outcome(
+                    str(record["id"]),
+                    bars,
+                    timeout_sessions=self.outcome_timeout_sessions,
+                    round_trip_cost_bps=self.outcome_cost_bps,
+                )
+            except (SignalLedgerError, ValueError, TypeError) as exc:
+                LOG.warning(
+                    "Cannot update signal ledger outcome for %s: %s",
+                    symbol,
+                    exc,
+                )
+
+    def _record_live_signal(self, signal: DeepSignal) -> None:
+        if self.outcome_ledger is None:
+            return
+        plan = signal.trade_plan or build_trade_plan(signal.quote, signal.bars)
+        breakdown = signal.breakdown
+        reviews: list[dict[str, Any]] = []
+        review_getter = getattr(self.scanner, "reviews_for", None)
+        if callable(review_getter):
+            candidate_reviews = review_getter(signal.symbol)
+            if isinstance(candidate_reviews, list):
+                reviews = [item for item in candidate_reviews if isinstance(item, dict)]
+        features = {
+            "quote": asdict(signal.quote),
+            "fundamentals": asdict(signal.snapshot),
+            "score_breakdown": asdict(breakdown) if breakdown is not None else None,
+            "macro": asdict(signal.macro) if signal.macro is not None else None,
+            "backtest_20": asdict(signal.backtest) if signal.backtest is not None else None,
+            "backtest_60": asdict(signal.backtest_3m) if signal.backtest_3m is not None else None,
+            "latest_bar": asdict(signal.bars[-1]) if signal.bars else None,
+            "reasons": list(signal.reasons),
+        }
+        try:
+            self.outcome_ledger.record_signal(
+                symbol=signal.symbol,
+                signal_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+                entry_plan={
+                    "method": "next_open",
+                    "reference_price": signal.quote.price,
+                    "entry_low": plan.entry_low,
+                    "entry_high": plan.entry_high,
+                    "quote_as_of": signal.quote.as_of,
+                    "max_entry_sessions": 3,
+                },
+                targets=[
+                    {"label": "T1", "price": plan.target_1},
+                    {"label": "T2", "price": plan.target_2},
+                    {"label": "T3", "price": plan.target_3},
+                ],
+                stop=plan.stop,
+                score_version=(breakdown.version if breakdown is not None else SCORE_VERSION),
+                features=features,
+                model_reviews=reviews,
+                score=signal.score,
+            )
+        except (SignalLedgerError, ValueError, TypeError) as exc:
+            LOG.warning("Cannot record live signal %s: %s", signal.symbol, exc)
 
     def handle_update(self, update: dict[str, Any]) -> None:
         message = update.get("message") if isinstance(update, dict) else None
@@ -3641,12 +4449,58 @@ class BotApplication:
                     else "chưa cấu hình"
                 )
                 result = self.usage_store.format_status(gemini_status)
+                result += "\nTrạng thái council: " + html.escape(
+                    self._scanner_council_status()
+                )
                 provider_status = getattr(self.provider, "status_text", None)
                 if callable(provider_status):
                     status_text = provider_status()
                     if isinstance(status_text, str) and status_text:
                         result += "\n\n" + status_text
                 return result
+            if command == "/performance":
+                if self.outcome_ledger is None:
+                    return "Signal ledger chưa được cấu hình."
+                self._refresh_live_outcomes()
+                summary = self.outcome_ledger.summary()
+                hit_rate = summary.get("hit_rate_pct")
+                expectancy = summary.get("expectancy_r")
+                net_return = summary.get("average_net_return_pct")
+                lines = [
+                    "<b>Hiệu suất tín hiệu live</b>\n"
+                    f"Tổng: {summary['total']} · mở: {summary['open']} · "
+                    f"win/loss/timeout: {summary['win']}/{summary['loss']}/{summary['timeout']}"
+                ]
+                if hit_rate is None:
+                    lines.append("Hit-rate T1/stop: chưa đủ giao dịch đã ngã ngũ")
+                else:
+                    barrier_trials = int(summary["win"]) + int(summary["loss"])
+                    lower = _wilson_lower_percent(int(summary["win"]), barrier_trials)
+                    lines.append(
+                        f"Hit-rate T1/stop: {hit_rate:.1f}%"
+                        + (f" · cận dưới Wilson 95% {lower:.1f}%" if lower is not None else "")
+                    )
+                if expectancy is not None and net_return is not None:
+                    lines.append(
+                        f"Kỳ vọng: {expectancy:+.2f}R · lợi nhuận ròng TB {net_return:+.2f}%"
+                    )
+                else:
+                    lines.append("Kỳ vọng sau phí: chưa đủ dữ liệu")
+                for version, metrics in summary["by_score_version"].items():
+                    version_expectancy = metrics.get("expectancy_r")
+                    version_text = (
+                        f" · {version_expectancy:+.2f}R"
+                        if version_expectancy is not None
+                        else ""
+                    )
+                    lines.append(
+                        f"{html.escape(version)}: {metrics['resolved']}/{metrics['total']} đã đóng"
+                        f"{version_text}"
+                    )
+                lines.append(
+                    "<i>Đây là kết quả live đã ghi sổ, không phải cam kết hiệu suất tương lai.</i>"
+                )
+                return "\n".join(lines)
             if command == "/quote":
                 argument = _argument(text)
                 if not argument:
@@ -3683,7 +4537,7 @@ class BotApplication:
                 if daily_limit:
                     return daily_limit
                 quote = self.provider.get_quote(symbol)
-                bars = self.provider.get_history(symbol, range_value="2y", interval="1d")
+                bars = self.provider.get_history(symbol, range_value="5y", interval="1d")
                 snapshot = self.provider.get_fundamentals(symbol)
                 macro = (
                     self.macro_client.latest()
@@ -3696,8 +4550,22 @@ class BotApplication:
                     [symbol],
                     macro_client=self.macro_client,
                 )
+                scanner_cost = getattr(
+                    scanner,
+                    "backtest_cost_pct",
+                    DEFAULT_BACKTEST_COST_PCT,
+                )
+                if not isinstance(scanner_cost, (int, float)):
+                    scanner_cost = DEFAULT_BACKTEST_COST_PCT
                 return scanner.render_signal(
-                    build_deep_signal(symbol, snapshot, quote, bars, macro)
+                    build_deep_signal(
+                        symbol,
+                        snapshot,
+                        quote,
+                        bars,
+                        macro,
+                        backtest_cost_pct=float(scanner_cost),
+                    )
                 )
             if command in {"/news", "/new", "/tintuc", "/macro"}:
                 argument = _argument(text)
@@ -3776,9 +4644,11 @@ class BotApplication:
                     if self.scanner is not None
                     else "chưa cấu hình"
                 )
+                council_status = self._scanner_council_status()
                 return (
                     f"Tín hiệu: {'đang bật' if enabled else 'đang tắt'}\n"
                     f"Gemini: {gemini_status}\n"
+                    f"Council: {council_status}\n"
                     f"Giới hạn: tối đa {self.monthly_signal_limit} mã/tháng\n"
                     f"Cooldown mỗi mã: {self.signal_cooldown_days} ngày\n"
                     f"Lần quét cuối: {self.signal_store.last_scan_date() or 'chưa có'}"
@@ -3837,6 +4707,7 @@ class BotApplication:
     def run_signal_scan(self, manual: bool = False) -> str | None:
         if not self.signal_store or not self.scanner:
             return "Tính năng tín hiệu chưa được cấu hình."
+        self._refresh_live_outcomes()
         chats = self.signal_store.chats()
         if not chats and not manual:
             return None
@@ -3851,8 +4722,11 @@ class BotApplication:
                 break
             if self.signal_store.recently_sent(candidate.symbol, now, self.signal_cooldown_days):
                 continue
-            messages.append(self.scanner.render_signal(candidate))
+            messages.append(
+                self.scanner.render_signal(candidate, allow_burst=bool(messages))
+            )
             self.signal_store.record_sent(candidate.symbol, now)
+            self._record_live_signal(candidate)
         if manual and not messages:
             return "Quét xong: chưa có mã VN100 nào đạt ngưỡng chiết khấu đủ sâu."
         for message in messages:
@@ -3936,6 +4810,12 @@ def build_application() -> BotApplication:
         news_daily_limit = int(
             os.environ.get("NEWS_DAILY_LIMIT", DEFAULT_NEWS_DAILY_LIMIT)
         )
+        council_daily_budget = int(
+            os.environ.get(
+                "MODEL_COUNCIL_DAILY_BUDGET",
+                DEFAULT_COUNCIL_DAILY_BUDGET,
+            )
+        )
         vnstock_daily_budget = int(
             os.environ.get("VNSTOCK_DAILY_BUDGET", DEFAULT_VNSTOCK_DAILY_BUDGET)
         )
@@ -3966,6 +4846,33 @@ def build_application() -> BotApplication:
         news_max_items = int(
             os.environ.get("NEWS_MAX_ITEMS", DEFAULT_NEWS_MAX_ITEMS)
         )
+        backtest_cost_pct = float(
+            os.environ.get("BACKTEST_ROUND_TRIP_COST_PCT", DEFAULT_BACKTEST_COST_PCT)
+        )
+        min_backtest_resolved = int(
+            os.environ.get("MIN_BACKTEST_RESOLVED", DEFAULT_MIN_BACKTEST_RESOLVED)
+        )
+        min_backtest_win_lower = float(
+            os.environ.get("MIN_BACKTEST_WIN_LOWER", DEFAULT_MIN_BACKTEST_WIN_LOWER)
+        )
+        min_backtest_expectancy_r = float(
+            os.environ.get(
+                "MIN_BACKTEST_EXPECTANCY_R",
+                DEFAULT_MIN_BACKTEST_EXPECTANCY_R,
+            )
+        )
+        min_backtest_fill_rate = float(
+            os.environ.get(
+                "MIN_BACKTEST_FILL_RATE",
+                DEFAULT_MIN_BACKTEST_FILL_RATE,
+            )
+        )
+        max_history_staleness_days = int(
+            os.environ.get(
+                "MAX_HISTORY_STALENESS_DAYS",
+                DEFAULT_MAX_HISTORY_STALENESS_DAYS,
+            )
+        )
     except ValueError as exc:
         raise ValueError("Các biến timeout/score/limit phải là số.") from exc
     telegram = TelegramClient(token, timeout=max(10.0, poll_timeout + 10.0))
@@ -3976,6 +4883,7 @@ def build_application() -> BotApplication:
         deep_daily_limit=deep_daily_limit,
         scan_daily_limit=scan_daily_limit,
         news_daily_limit=news_daily_limit,
+        council_daily_budget=council_daily_budget,
     )
     yahoo_provider = YahooQuoteProvider(timeout=max(1.0, yahoo_timeout))
     provider = RoutedMarketDataProvider(
@@ -4012,6 +4920,9 @@ def build_application() -> BotApplication:
         usage_store=usage_store,
         macro_client=macro_client,
         news_service=news_service,
+        outcome_ledger=SignalLedger(data_dir / "signal_ledger.json"),
+        outcome_timeout_sessions=20,
+        outcome_cost_bps=backtest_cost_pct * 100.0,
         scanner=DeepSignalScanner(
             provider=provider,
             gemini=gemini,
@@ -4020,6 +4931,22 @@ def build_application() -> BotApplication:
             min_score=min_signal_score,
             max_per_scan=max_signals_per_scan,
             max_workers=scan_workers,
+            require_backtest=parse_bool(
+                os.environ.get("SIGNAL_REQUIRE_BACKTEST"),
+                True,
+            ),
+            min_backtest_resolved=min_backtest_resolved,
+            min_backtest_win_lower=min_backtest_win_lower,
+            min_backtest_expectancy_r=min_backtest_expectancy_r,
+            min_backtest_fill_rate=min_backtest_fill_rate,
+            backtest_cost_pct=backtest_cost_pct,
+            council=build_model_council(),
+            council_usage_store=usage_store,
+            require_dated_history=parse_bool(
+                os.environ.get("SIGNAL_REQUIRE_DATED_HISTORY"),
+                True,
+            ),
+            max_history_staleness_days=max_history_staleness_days,
         ),
         monthly_signal_limit=monthly_signal_limit,
         signal_cooldown_days=signal_cooldown_days,
@@ -4050,7 +4977,7 @@ def main() -> int:
             scan_time=parse_scan_time(os.environ.get("SCAN_TIME", DEFAULT_SCAN_TIME)),
         )
         return 0
-    except (ValueError, BotError) as exc:
+    except (ValueError, BotError, SignalLedgerError) as exc:
         LOG.error("%s", exc)
         return 2
 

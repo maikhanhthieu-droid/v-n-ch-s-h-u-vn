@@ -182,9 +182,11 @@ class BotTests(unittest.TestCase):
             fifty_two_week_high=80.0,
         )
         bars = [PriceBar(close=70.0 + index / 10) for index in range(30)]
-        score, reasons = score_candidate(snapshot, quote, bars)
-        self.assertLess(score, 70)
-        self.assertFalse(any("P/E" in reason or "P/B" in reason for reason in reasons))
+        breakdown, reasons = build_score_breakdown(snapshot, quote, bars)
+        self.assertLess(breakdown.total, 70)
+        self.assertEqual(breakdown.valuation, 2)
+        self.assertTrue(any("P/E" in reason for reason in reasons))
+        self.assertTrue(any("P/B" in reason for reason in reasons))
 
     def test_gemini_interactions_uses_grounding_and_high_thinking(self):
         captured = {}
@@ -576,6 +578,7 @@ class BotTests(unittest.TestCase):
         bars = [
             PriceBar(
                 close=100 + index * 0.03 + (index % 20) * 0.4,
+                open_price=99.9 + index * 0.03 + (index % 20) * 0.4,
                 high=100.8 + index * 0.03 + (index % 20) * 0.4,
                 low=99.2 + index * 0.03 + (index % 20) * 0.4,
                 volume=500_000,

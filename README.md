@@ -1,7 +1,8 @@
 # VN Equity Bot
 
 Bot Telegram để tra cứu, lọc định giá và theo dõi cổ phiếu Việt Nam. Bot chạy
-trên Python 3.10+ và dùng Google Gen AI SDK cho phần nghiên cứu có kiểm chứng.
+trên Python 3.10+; phần định lượng hoạt động độc lập với API LLM. Gemini, GLM và
+DeepSeek là các lớp nghiên cứu tùy chọn, không được quyền sửa điểm hoặc phát lệnh.
 
 ## Tính năng
 
@@ -21,6 +22,8 @@ trên Python 3.10+ và dùng Google Gen AI SDK cho phần nghiên cứu có ki�
   [`vimo-VN`](https://github.com/maikhanhthieu-droid/vimo-VN)
 - `/usage`: xem phần trăm ngân sách Gemini, VNStock, `/deep`, `/scan`, `/news`
   và sức khỏe từng nguồn
+- `/performance`: cập nhật và xem win/loss/timeout, expectancy R và lợi nhuận
+  ròng của chính các tín hiệu live đã được bot ghi sổ
 - `/signals_on`, `/signals_off`, `/signals_status`: bật/tắt tín hiệu lọc sâu VN100
 - `/scan`: quét VN100 ngay, mặc định chỉ gửi mã đạt ngưỡng đủ sâu
 - `/market`: VN-Index
@@ -31,9 +34,10 @@ trên Python 3.10+ và dùng Google Gen AI SDK cho phần nghiên cứu có ki�
 
 Bot phân vai nguồn dữ liệu: Yahoo cho giá nhanh, VNStock `VCI ↔ KBS` cho lịch sử/TA,
 TradingView cho số liệu doanh nghiệp/định giá theo lô, `vimo-VN` cho trạng thái vĩ
-mô, Google News RSS cho metadata tiêu đề. Khi VNStock hết ngân sách hoặc một nguồn
-lỗi, bot tự chuyển nguồn rồi rơi về Yahoo. Dữ liệu có thể trễ, thiếu hoặc không khả
-dụng; bot không đưa ra khuyến nghị đầu tư.
+mô, Google News RSS cho metadata tiêu đề. Lịch sử OHLCV giữ ngày, nguồn và cờ
+điều chỉnh; khi VNStock hết ngân sách hoặc một nguồn lỗi, bot tự chuyển nguồn rồi
+rơi về Yahoo. Dữ liệu có thể trễ, thiếu hoặc không khả dụng; bot không đưa ra
+khuyến nghị đầu tư.
 
 ## Chạy cục bộ
 
@@ -51,6 +55,10 @@ dụng; bot không đưa ra khuyến nghị đầu tư.
    $env:TELEGRAM_BOT_TOKEN = "<TOKEN_MỚI>"
    $env:GEMINI_API_KEY = "<KEY_GEMINI_THẬT>"
    $env:VNSTOCK_API_KEY = "<KEY_VNSTOCK_THẬT>"
+   # Chỉ thêm hai key sau khi muốn bật council tùy chọn:
+   $env:GLM_API_KEY = "<KEY_GLM_THẬT>"
+   $env:DEEPSEEK_API_KEY = "<KEY_DEEPSEEK_THẬT>"
+   $env:MODEL_COUNCIL_ENABLED = "true"
    ```
 
    Lưu ý: `os.environ.get("GEMINI_API_KEY")` chỉ là lệnh đọc biến môi trường,
@@ -92,12 +100,20 @@ có giới hạn. Khung điểm 100 cố định, Gemini chỉ giải thích và
 - Vĩ mô: `10` điểm — ánh xạ bảo thủ từ trạng thái trung lập của `vimo-VN`;
   không tải được nguồn thì giữ `5/10`
 
-`/deep` dùng tối đa hai năm dữ liệu để tìm các trạng thái xu hướng/RSI tương tự
-ở hai khung: 1 tháng (20 phiên) và 3 tháng (60 phiên). Mỗi khung hiển thị hai
-định nghĩa riêng: tỷ lệ chạm T1 trước stop, và tỷ lệ giá cuối kỳ cao hơn giá vào
-kèm lợi nhuận trung vị. Hit-rate T1 chỉ hiện khi có ít nhất 5 mẫu đã ngã ngũ;
-tỷ lệ cuối kỳ chỉ hiện khi có ít nhất 5 mẫu hoàn tất. Nếu cùng một nến ngày chạm
-cả target và stop, bot tính là stop. Các con số không phải xác suất tương lai.
+`/deep` và scanner dùng tối đa năm năm dữ liệu. Mẫu lịch sử phải giống trạng thái
+xu hướng/RSI và ít nhất một chế độ biến động/khối lượng; hai mẫu liên tiếp cách
+nhau tối thiểu bằng toàn bộ horizon nên cửa sổ kết quả không chồng lấn. Tín hiệu
+được tạo sau close, chờ tối đa ba next-open nằm trong vùng entry, dùng ATR/hỗ trợ
+chỉ từ dữ liệu có tại ngày lịch sử và trừ phí/trượt giá. Không có open hợp lệ thì
+ghi không khớp lệnh; tuyệt đối không lấy close cùng ngày thay cho open bị thiếu.
+Gap qua stop khớp ở open xấu hơn; cùng nến chạm cả target và stop được tính stop
+trước.
+
+Mỗi khung 20/60 phiên hiển thị hit-rate mô tả, cận dưới Wilson 95%, số mẫu hiệu
+dụng, lợi nhuận ròng trung vị và expectancy theo R. Scanner production mặc định
+chỉ xét khung 20 phiên và phải vượt đồng thời score, số mẫu, cận dưới Wilson và
+expectancy; khung 60 phiên chỉ để tham khảo. Đây vẫn không phải xác suất thắng
+tương lai hay kiểm định walk-forward toàn thị trường.
 
 Lệnh Telegram:
 
@@ -106,6 +122,7 @@ Lệnh Telegram:
 /signals_status
 /scan
 /deep FPT
+/performance
 /news FPT
 /macro
 ```
@@ -114,14 +131,14 @@ Biến cấu hình:
 
 - `GEMINI_API_KEY`: key Gemini thật; nếu thiếu, bot vẫn gửi điểm định lượng
 - `GEMINI_MODEL`: mặc định `gemini-3.5-flash-lite`
-- `GEMINI_FALLBACK_MODEL`: mặc định `gemini-2.5-flash-lite`
+- `GEMINI_FALLBACK_MODEL`: mặc định `gemini-3.1-flash-lite`
 - `GEMINI_THINKING_LEVEL`: mặc định `minimal`
 - `GEMINI_MAX_OUTPUT_TOKENS`: mặc định `1000`
 - `GEMINI_GOOGLE_SEARCH`: mặc định `false`; chỉ bật khi project có đủ quota grounding
 - `GEMINI_TIMEOUT`: mặc định `30` giây
 - `GEMINI_MIN_INTERVAL`: tối thiểu `60` giây giữa hai yêu cầu Gemini; bot trả
   thông báo cooldown ngay thay vì đứng chờ
-- `GEMINI_CACHE_TTL`: cache kết quả mỗi mã trong `1800` giây
+- `GEMINI_CACHE_TTL`: cache theo fingerprint facts/model/prompt/Search trong `1800` giây
 - `GEMINI_QUOTA_COOLDOWN`: khi gặp 429, ngừng gọi Gemini trong `900` giây
 - `RESEARCH_COMMAND_COOLDOWN`: `/deep`, `/scan` và `/news` cách nhau ít nhất `60` giây;
   `/ping`, `/quote` và các lệnh thường không bị ảnh hưởng
@@ -150,12 +167,66 @@ Biến cấu hình:
 - `MIN_SIGNAL_SCORE`: mặc định `70`
 - `SIGNAL_COOLDOWN_DAYS`: mặc định `30`
 - `VN100_SYMBOLS`: danh sách mã override, phân tách bằng dấu phẩy nếu rổ VN100 thay đổi
+- `SIGNAL_REQUIRE_BACKTEST`: mặc định `true`; bật gate thống kê cho scanner tự động
+- `SIGNAL_REQUIRE_DATED_HISTORY`: mặc định `true`; không phát signal tự động nếu
+  OHLCV thiếu ngày phiên
+- `MAX_HISTORY_STALENESS_DAYS`: tối đa `10` ngày lịch từ phiên OHLCV gần nhất
+  (đủ bao phủ cuối tuần/kỳ nghỉ dài; có thể siết theo hạ tầng dữ liệu)
+- `MIN_BACKTEST_RESOLVED`: tối thiểu `8` mẫu T1/stop đã ngã ngũ ở khung 20 phiên
+- `MIN_BACKTEST_WIN_LOWER`: cận dưới Wilson 95% tối thiểu, mặc định `45` (%)
+- `MIN_BACKTEST_EXPECTANCY_R`: expectancy ròng tối thiểu, mặc định `0.05R`
+- `MIN_BACKTEST_FILL_RATE`: tối thiểu `40%` mẫu có next-open khớp vùng entry
+- `BACKTEST_ROUND_TRIP_COST_PCT`: phí, thuế và slippage giả định khứ hồi,
+  mặc định `0.45%`
 
 Tín hiệu này là bộ lọc nghiên cứu tự động, không phải khuyến nghị mua/bán.
 
 Gemini chỉ là lớp diễn giải. Khi bật Search mà phản hồi không có nguồn grounding,
 hoặc phản hồi chứa số không có trong dữ liệu deterministic đầu vào, nội dung đó
-bị loại; bot vẫn tiếp tục với kết quả chấm điểm gốc.
+bị loại; bot vẫn tiếp tục với kết quả chấm điểm gốc. Cache Gemini được fingerprint
+theo toàn bộ facts/model/prompt/Search thay vì chỉ theo mã. Fallback được phép bỏ
+qua local interval đúng một lần nhưng vẫn chịu daily budget và circuit breaker.
+Google Search chỉ bổ sung sự kiện/tin có nguồn; giá, OHLCV và số dùng để gate luôn
+lấy từ provider có timestamp, không lấy từ snippet web.
+
+## Council GLM + DeepSeek (tùy chọn, API điền sau)
+
+Mặc định hai API key để trống nên clone chạy quant-only và không gọi provider.
+`MODEL_COUNCIL_ENABLED=false` là kill switch; khi có đủ cả hai key và flag không
+bị tắt, backend gửi cùng một evidence snapshot bất biến
+cho GLM (chất lượng doanh nghiệp) và DeepSeek (phản biện rủi ro) song song qua API
+OpenAI-compatible. Mỗi model chỉ được trả JSON hẹp gồm verdict, confidence nội bộ,
+evidence ID, rủi ro và dữ liệu còn thiếu. Timeout, JSON sai hoặc thiếu key đều trở
+thành `abstain`; không làm scanner dừng.
+
+Council hiện chạy **shadow-only**: kết quả được lưu cùng signal ledger và đưa cho
+Gemini để tổng hợp, nhưng không thay đổi score, target/stop, gate backtest hoặc
+thứ hạng. Chỉ nên cho council tác động lựa chọn sau khi `/performance` chứng minh
+lift ngoài mẫu trên đủ dữ liệu live.
+
+Biến cấu hình:
+
+- `GLM_API_KEY`, `DEEPSEEK_API_KEY`: để trống cho đến khi bạn điền key thật
+- `GLM_BASE_URL=https://api.z.ai/api/paas/v4`, `GLM_MODEL=glm-5.2`
+- `DEEPSEEK_BASE_URL=https://api.deepseek.com`, `DEEPSEEK_MODEL=deepseek-v4-flash`
+- `MODEL_COUNCIL_REQUEST_TIMEOUT=20`, `MODEL_COUNCIL_OVERALL_TIMEOUT=22`
+- `MODEL_COUNCIL_MAX_OUTPUT_TOKENS=800`, `MODEL_COUNCIL_CACHE_TTL=900`
+- `MODEL_COUNCIL_DAILY_BUDGET=4`: tối đa bốn lượt council/ngày; mỗi lượt gọi
+  đồng thời một GLM và một DeepSeek
+
+Endpoint GLM trên là Z.AI quốc tế. Nếu API key được tạo trên BigModel Trung Quốc,
+đổi `GLM_BASE_URL` thành `https://open.bigmodel.cn/api/paas/v4`.
+
+Không cần cấp MCP cho Gemini trong đường production này. Backend điều phối trực
+tiếp giúp giữ API key ngoài prompt, giới hạn đúng hai endpoint và tránh cho model
+quyền gọi HTTP/tool tùy ý. MCP chỉ nên thêm sau nếu cần dùng chung các tool
+read-only cho nhiều ứng dụng; nó không tự làm tăng win rate.
+
+`data/signal_ledger.json` lưu snapshot bất biến, feature hash, score version,
+review model và outcome next-open sau phí. File này được ignore khỏi Git và được
+GitHub Actions cache cùng state bot. Không có API key/token nào được phép ghi vào
+ledger. Khi Yahoo là nguồn dự phòng, bot giữ riêng OHLC raw để ledger so với
+entry/target/stop raw; chuỗi OHLC đã điều chỉnh chỉ dùng cho TA/backtest.
 
 Kiến trúc chia sẻ dữ liệu giữa các repository được mô tả tại
 [`docs/ECOSYSTEM_DATA_CONTRACT.md`](docs/ECOSYSTEM_DATA_CONTRACT.md).
@@ -185,6 +256,12 @@ long polling và runner trả kết quả về cuộc trò chuyện.
 4. Chờ job hiện màu vàng/xanh, sau đó gửi `/ping`, `/usage` hoặc `/deep FPT`.
 5. Hết thời gian bot tự dừng. Có thể bấm **Cancel workflow** để dừng sớm.
 
+Khi muốn bật council sau này, vào **Settings → Secrets and variables → Actions**,
+thêm hai repository secret `GLM_API_KEY` và `DEEPSEEK_API_KEY`. Workflow đã có
+base URL/model/budget; không đưa key vào `.env.example`, source code hoặc log.
+Để Gemini bổ sung sự kiện hiện tại có grounding, tạo thêm repository variable
+`GEMINI_GOOGLE_SEARCH=true`; nếu không, workflow giữ chế độ định lượng tiết kiệm quota.
+
 Chỉ một phiên được phép chạy cùng lúc. Lệnh `/start` trong Telegram không thể tự
 khởi động một runner đã tắt; phải mở phiên GitHub trước. Cách này dành cho phiên
 thử nghiệm theo yêu cầu, không thay thế dịch vụ bot 24/7.
@@ -199,6 +276,12 @@ TradingView và RSS có thể thiếu/chậm; tiêu đề không thay thế nộ
 Đối với ngân hàng/bảo hiểm, D/E và current ratio không được chấm như doanh nghiệp
 thông thường; bot giữ điểm trung tính và nhắc so sánh theo ngành. Target/stop chỉ
 là kịch bản theo ATR/hỗ trợ gần để chuẩn hóa rủi ro, không phải mức giá bảo đảm.
+
+Score v2 sửa trường hợp P/E/P/B âm bị cộng điểm, trừ điểm CFO/FCF âm ở doanh
+nghiệp phi tài chính và giảm độ tin cậy khi thiếu trường lõi. Score vẫn là heuristic
+có thể audit, chưa phải xác suất đã calibrate. Cận Wilson và expectancy làm gate
+bảo thủ hơn nhưng không loại được survivorship bias, dữ liệu tài chính không
+point-in-time hoặc thay đổi chế độ thị trường; cần tiếp tục tích lũy ledger live.
 
 Phần `/deep` hiển thị riêng kỳ dữ liệu tài chính và thời điểm lấy dữ liệu. Ngoài
 ROE, D/E và current ratio, bot lấy thêm vốn chủ sở hữu, tổng tài sản, tỷ lệ

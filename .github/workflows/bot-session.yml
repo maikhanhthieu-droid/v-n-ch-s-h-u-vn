@@ -46,6 +46,7 @@ jobs:
             data/api_usage.json
             data/watchlists.json
             data/signal_state.json
+            data/signal_ledger.json
           key: vn-equity-bot-state-${{ github.run_id }}
           restore-keys: |
             vn-equity-bot-state-
@@ -65,12 +66,26 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           VNSTOCK_API_KEY: ${{ secrets.VNSTOCK_API_KEY }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DATA_DIR: data
-          GEMINI_GOOGLE_SEARCH: "false"
+          GEMINI_GOOGLE_SEARCH: ${{ vars.GEMINI_GOOGLE_SEARCH || 'false' }}
+          MODEL_COUNCIL_ENABLED: ${{ vars.MODEL_COUNCIL_ENABLED || 'true' }}
+          GLM_MODEL: "glm-5.2"
+          DEEPSEEK_MODEL: "deepseek-v4-flash"
+          MODEL_COUNCIL_DAILY_BUDGET: "4"
           RESEARCH_COMMAND_COOLDOWN: "60"
           SCAN_WORKERS: "2"
+          SIGNAL_REQUIRE_BACKTEST: "true"
+          SIGNAL_REQUIRE_DATED_HISTORY: "true"
+          MAX_HISTORY_STALENESS_DAYS: "10"
+          MIN_BACKTEST_RESOLVED: "8"
+          MIN_BACKTEST_WIN_LOWER: "45"
+          MIN_BACKTEST_EXPECTANCY_R: "0.05"
+          MIN_BACKTEST_FILL_RATE: "40"
+          BACKTEST_ROUND_TRIP_COST_PCT: "0.45"
         shell: bash
         run: |
           set +e
@@ -93,4 +108,5 @@ jobs:
             data/api_usage.json
             data/watchlists.json
             data/signal_state.json
+            data/signal_ledger.json
           key: vn-equity-bot-state-${{ github.run_id }}

@@ -8,6 +8,8 @@ __pycache__/
 .mypy_cache/
 .coverage
 data/*.tmp
+data/api_usage.json
 data/watchlists.json
 data/signal_state.json
+data/signal_ledger.json
 *.log

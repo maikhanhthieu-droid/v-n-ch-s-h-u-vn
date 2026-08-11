@@ -51,12 +51,15 @@ không được dùng thay thế cho nhau.
 - Snapshot doanh nghiệp phải giữ riêng `fundamentals_as_of` (kỳ BCTC),
   `fundamentals_fetched_at` (lúc lấy) và nguồn. Không gọi dữ liệu quý là dữ liệu
   thời gian thực; giá thị trường và kỳ báo cáo tài chính không dùng chung ngày.
-- GPT và GLM đánh giá độc lập trên facts mẫu hình. Đồng thuận AI không được
-  nâng hạng một mã chưa qua scanner deterministic.
+- GLM và DeepSeek đánh giá độc lập trên cùng evidence snapshot. Backend gọi hai
+  API song song; Gemini chỉ tổng hợp. Đồng thuận AI không được nâng hạng một mã
+  chưa qua scanner deterministic.
 - Gemini giải thích trạng thái hiện tại. Phản hồi Search không có grounding
   source hoặc có con số mới không nằm trong input phải bị loại.
 - Mọi lỗi mạng, quota hoặc API AI phải fail-open đối với việc quét và
   fail-closed đối với nội dung AI: scanner vẫn chạy, phần AI không được xuất bản.
+- Mỗi tín hiệu đã gửi phải được ghi vào signal ledger versioned với feature hash,
+  score version, next-open plan, chi phí và outcome; không được ghi API key/token.
 
 ## Lọc mục tiêu tăng 20–30%
 
