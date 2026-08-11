@@ -83,7 +83,7 @@ DEFAULT_GEMINI_TIMEOUT = 30
 DEFAULT_GEMINI_MIN_INTERVAL = 60.0
 DEFAULT_GEMINI_CACHE_TTL = 1800
 DEFAULT_GEMINI_QUOTA_COOLDOWN = 900
-DEFAULT_AI_PANEL_MAX_WORDS = 30
+DEFAULT_AI_PANEL_MAX_WORDS = 80
 DEFAULT_RESEARCH_COMMAND_COOLDOWN = 60.0
 DEFAULT_GEMINI_DAILY_BUDGET = 6
 DEFAULT_DEEP_DAILY_LIMIT = 3
@@ -2068,7 +2068,7 @@ class AssistantConversationStore:
         words = str(response).strip().split()
         if not words:
             raise ValueError("Phản hồi trợ lý đang trống.")
-        concise = " ".join(words[: max(10, min(int(max_words), 30))])
+        concise = " ".join(words[: max(40, min(int(max_words), 80))])
         with self._lock:
             session = self._data.get(str(chat_id))
             if not isinstance(session, dict):
@@ -2794,9 +2794,12 @@ class GeminiAnalyzer:
         final_prompt = (
             "Bạn là thư ký trung lập của hội đồng nghiên cứu cổ phiếu. Chỉ dùng bằng chứng "
             "và phản hồi được cung cấp. Không được tạo số mới, sửa score/target/stop, hoặc gọi "
-            "thống kê quá khứ là xác suất tương lai. Trả lời tiếng Việt đúng 3 dòng: "
-            "TRẠNG THÁI: CHỜ hoặc THEO DÕI hoặc LOẠI; ĐỒNG THUẬN: tối đa 30 từ; "
-            "CẢNH BÁO/XÚC TÁC: tối đa 30 từ. Nếu thiếu phản hồi thì nói rõ nguồn thiếu.\n\n"
+            "thống kê quá khứ là xác suất tương lai. Trả lời tiếng Việt đúng 5 dòng: "
+            "TRẠNG THÁI: CHỜ hoặc THEO DÕI hoặc LOẠI; "
+            "VÙNG MUA: chỉ chọn trong vùng quant, hoặc ghi CHƯA MUA; "
+            "VÙNG BÁN/CHỐT LỜI: chỉ dùng T1/T2/T3 của quant; "
+            "STOP: giữ nguyên stop quant; "
+            "CẢNH BÁO/XÚC TÁC: tối đa 40 từ và nói rõ nguồn trợ lý còn thiếu.\n\n"
             + str(prompt)[:10000]
         )
         cache_key = self._prompt_cache_key("PANEL", final_prompt, False)
@@ -4807,8 +4810,10 @@ class BotApplication:
         ) or "- Chưa có góc nhìn trợ lý nào."
         return (
             f"Bạn là {target}, trợ lý nghiên cứu trung lập. Đọc dữ liệu quant và ý kiến trước; "
-            "trả lời 10-30 từ, gồm trạng thái CHỜ/THEO DÕI/LOẠI và đúng một cảnh báo hoặc "
-            "xúc tác. Không sửa score, target hay stop; không gọi hit-rate là xác suất thắng.\n"
+            "trả lời 40-80 từ theo đúng 5 dòng: TRẠNG THÁI; VÙNG MUA; VÙNG BÁN/CHỐT LỜI; "
+            "STOP; CẢNH BÁO/XÚC TÁC. Vùng mua chỉ được nằm trong vùng vào quant; vùng bán "
+            "chỉ dùng T1/T2/T3. Nếu chưa đủ điều kiện thì ghi CHƯA MUA. Không sửa score, "
+            "target hay stop; không gọi hit-rate là xác suất thắng.\n"
             f"{session.get('evidence', '')}\nÝ kiến trước:\n{prior}"
         )
 

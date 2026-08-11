@@ -14,8 +14,11 @@ web đã đăng nhập.
 4. Gửi `/ai_prompt glm` để nhận prompt kế tiếp có cả những ý kiến đã thu thập.
 5. Gửi `/ai_summary` để Gemini tổng hợp trung lập; `/ai_status` để xem lại.
 
-Mỗi phản hồi được giữ tối đa 30 từ. Phần tổng hợp không được sửa score, vùng vào,
-target, stop hoặc gọi hit-rate quá khứ là xác suất thắng tương lai. Các phiên được
+Mỗi phản hồi được giữ trong khoảng tối đa 80 từ và phải nêu trạng thái, vùng mua,
+vùng bán/chốt lời, stop cùng một cảnh báo hoặc xúc tác. Các mốc giá chỉ được chọn
+từ vùng vào và T1/T2/T3 do quant cung cấp; nếu dữ liệu chưa đủ thì phải ghi
+`CHƯA MUA`. Phần tổng hợp không được sửa score, vùng vào, target, stop hoặc gọi
+hit-rate quá khứ là xác suất thắng tương lai. Các phiên được
 lưu ở `data/assistant_conversations.json` và được workflow khôi phục qua cache.
 
 ## Ngân sách GitHub mặc định
@@ -26,4 +29,3 @@ lưu ở `data/assistant_conversations.json` và được workflow khôi phục 
 - Lịch scan tự động: thứ Hai (`SCAN_WEEKDAYS=0`).
 - GLM/DeepSeek API mặc định tắt; bật lại `MODEL_COUNCIL_ENABLED=true` chỉ khi tài
   khoản API có quota. Link web trong `/panel` vẫn dùng được khi council API tắt.
-
