@@ -74,8 +74,7 @@ DEFAULT_POLL_TIMEOUT = 25
 DEFAULT_YAHOO_TIMEOUT = 12
 DEFAULT_SCAN_WEEKDAYS = "0,3"
 DEFAULT_SCAN_TIME = "20:30"
-DEFAULT_MONTHLY_SIGNAL_LIMIT = 2
-DEFAULT_SIGNAL_COOLDOWN_DAYS = 30
+DEFAULT_DAILY_SHORTLIST_LIMIT = 3
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_GEMINI_FALLBACK_MODEL = "gemini-3.1-flash-lite"
 DEFAULT_GEMINI_THINKING_LEVEL = "minimal"
@@ -85,11 +84,11 @@ DEFAULT_GEMINI_MIN_INTERVAL = 60.0
 DEFAULT_GEMINI_CACHE_TTL = 1800
 DEFAULT_GEMINI_QUOTA_COOLDOWN = 900
 DEFAULT_RESEARCH_COMMAND_COOLDOWN = 60.0
-DEFAULT_GEMINI_DAILY_BUDGET = 12
-DEFAULT_DEEP_DAILY_LIMIT = 10
-DEFAULT_SCAN_DAILY_LIMIT = 2
+DEFAULT_GEMINI_DAILY_BUDGET = 6
+DEFAULT_DEEP_DAILY_LIMIT = 3
+DEFAULT_SCAN_DAILY_LIMIT = 1
 DEFAULT_NEWS_DAILY_LIMIT = 8
-DEFAULT_COUNCIL_DAILY_BUDGET = 4
+DEFAULT_COUNCIL_DAILY_BUDGET = 3
 DEFAULT_SCAN_WORKERS = 2
 DEFAULT_VNSTOCK_DAILY_BUDGET = 60
 DEFAULT_VNSTOCK_REQUESTS_PER_MINUTE = 12
@@ -111,8 +110,8 @@ DEFAULT_MIN_BACKTEST_WIN_LOWER = 45.0
 DEFAULT_MIN_BACKTEST_EXPECTANCY_R = 0.05
 DEFAULT_MIN_BACKTEST_FILL_RATE = 40.0
 DEFAULT_MAX_HISTORY_STALENESS_DAYS = 10
-SCORE_VERSION = "v2.0"
-GEMINI_PROMPT_VERSION = "v2.0"
+SCORE_VERSION = "v2.1"
+GEMINI_PROMPT_VERSION = "v2.1"
 
 VN100_SYMBOLS = [
     "AAA", "ACB", "ANV", "APH", "ASM", "BCM", "BID", "BMP", "BSI", "BVH",
@@ -355,6 +354,13 @@ class BacktestResult:
     sample_indices: tuple[int, ...] = ()
     sample_dates: tuple[str, ...] = ()
     not_filled: int = 0
+    # A filled position that reaches neither T1 nor stop before the horizon is
+    # still a failed T1-within-horizon observation.  Keep this metric separate
+    # from the legacy barrier-only hit rate, which intentionally excludes such
+    # timeouts from its denominator.
+    target_trials: int = 0
+    target_hit_rate: float | None = None
+    target_hit_rate_lower: float | None = None
 
 
 @dataclass(frozen=True)
@@ -1868,11 +1874,16 @@ class WatchlistStore:
 
 
 class SignalStore:
-    """Persist Telegram chats and cooldowns for deep-value alerts."""
+    """Persist subscribers, shortlist state and cooldowns for research alerts."""
 
     def __init__(self, path: Path):
         self.path = path
-        self._data: dict[str, Any] = {"chats": [], "sent": [], "last_scan_date": ""}
+        self._data: dict[str, Any] = {
+            "chats": [],
+            "last_scan_date": "",
+            "shortlist_date": "",
+            "shortlist": [],
+        }
         self._load()
 
     def _load(self) -> None:
@@ -1886,11 +1897,12 @@ class SignalStore:
         if not isinstance(raw, dict):
             return
         chats = raw.get("chats", [])
-        sent = raw.get("sent", [])
+        shortlist = raw.get("shortlist", [])
         self._data = {
             "chats": [str(chat) for chat in chats if str(chat).strip()],
-            "sent": sent if isinstance(sent, list) else [],
             "last_scan_date": str(raw.get("last_scan_date") or ""),
+            "shortlist_date": str(raw.get("shortlist_date") or ""),
+            "shortlist": shortlist if isinstance(shortlist, list) else [],
         }
 
     def _save(self) -> None:
@@ -1937,36 +1949,53 @@ class SignalStore:
         self._data["last_scan_date"] = date_key
         self._save()
 
-    def sent_this_month(self, now: datetime) -> int:
-        month = now.strftime("%Y-%m")
-        return sum(1 for item in self._data.get("sent", []) if str(item.get("month")) == month)
+    def shortlist(self, date_key: str) -> list[dict[str, Any]]:
+        if str(self._data.get("shortlist_date") or "") != str(date_key):
+            return []
+        return [
+            dict(item)
+            for item in self._data.get("shortlist", [])
+            if isinstance(item, dict) and str(item.get("symbol") or "").strip()
+        ]
 
-    def recently_sent(self, symbol: str, now: datetime, cooldown_days: int) -> bool:
-        cutoff = time.mktime(now.timetuple()) - cooldown_days * 86400
-        for item in self._data.get("sent", []):
-            if str(item.get("symbol")) != symbol:
-                continue
-            try:
-                sent_at = float(item.get("sent_at"))
-            except (TypeError, ValueError):
-                continue
-            if sent_at >= cutoff:
-                return True
-        return False
+    def save_shortlist(self, date_key: str, items: list[dict[str, Any]]) -> None:
+        """Merge one day's deterministic shortlist, capped at three unique symbols."""
 
-    def record_sent(self, symbol: str, now: datetime) -> None:
-        sent = self._data.setdefault("sent", [])
-        sent.append(
-            {
-                "symbol": symbol,
-                "sent_at": time.mktime(now.timetuple()),
-                "month": now.strftime("%Y-%m"),
-            }
-        )
-        # Keep the file small; only recent state matters for this scanner.
-        self._data["sent"] = sent[-200:]
+        existing = self.shortlist(date_key)
+        merged: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in [*existing, *items]:
+            if not isinstance(item, dict):
+                continue
+            symbol = str(item.get("symbol") or "").strip().upper()
+            if not symbol or symbol in seen:
+                continue
+            safe_item = dict(item)
+            safe_item["symbol"] = symbol
+            safe_item["deep_analyzed"] = bool(safe_item.get("deep_analyzed", False))
+            merged.append(safe_item)
+            seen.add(symbol)
+            if len(merged) >= DEFAULT_DAILY_SHORTLIST_LIMIT:
+                break
+        self._data["shortlist_date"] = str(date_key)
+        self._data["shortlist"] = merged
         self._save()
 
+    def claim_shortlist_deep(self, date_key: str, symbol: str) -> bool:
+        """Return True exactly once when a deep request matches today's shortlist."""
+
+        if str(self._data.get("shortlist_date") or "") != str(date_key):
+            return False
+        normalized = str(symbol).strip().upper()
+        for item in self._data.get("shortlist", []):
+            if not isinstance(item, dict) or str(item.get("symbol") or "").upper() != normalized:
+                continue
+            if bool(item.get("deep_analyzed")):
+                return False
+            item["deep_analyzed"] = True
+            self._save()
+            return True
+        return False
 
 class ApiUsageStore:
     """Persist conservative daily counters used to protect upstream quotas."""
@@ -2104,7 +2133,7 @@ class ApiUsageStore:
             f"/deep: {deep['used']}/{deep['limit']} "
             f"— {self._meter(deep['used'], deep['limit'])}\n"
             f"/scan: {scan['used']}/{scan['limit']} "
-            f"— {self._meter(scan['used'], scan['limit'])}\n"
+            f"— {self._meter(scan['used'], scan['limit'])} (0 lượt AI theo thiết kế)\n"
             f"/news: {news['used']}/{news['limit']} "
             f"— {self._meter(news['used'], news['limit'])}\n"
             f"Council GLM+DeepSeek: {council['used']}/{council['limit']} "
@@ -2308,7 +2337,9 @@ class GeminiAnalyzer:
             "đưa tin, số liệu kết quả kinh doanh hay sự kiện không xuất hiện trong đầu vào."
         )
         return (
-            "Bạn là chuyên viên hỗ trợ nghiên cứu cổ phiếu Việt Nam. Dữ liệu định lượng "
+            "Bạn là tầng kiểm chứng và tổng hợp cuối cùng cho nghiên cứu cổ phiếu Việt Nam. "
+            "GLM đã phụ trách cơ bản/định giá; DeepSeek đã phụ trách kỹ thuật/phản biện rủi ro. "
+            "Không lặp lại hai vai trò đó nếu không cần đối chiếu. Dữ liệu định lượng "
             "bên dưới do hệ thống cung cấp; không được tự sửa, suy diễn hoặc bịa số còn thiếu. "
             f"{web_instruction} "
             "Điểm 100, target/stop và backtest là kết quả cố định của hệ thống: chỉ được giải "
@@ -2360,15 +2391,16 @@ class GeminiAnalyzer:
             f"confidence={macro.confidence}\n"
             f"Lý do lọc: {', '.join(signal.reasons)}\n\n"
             + (
-                "Phản biện độc lập GLM/DeepSeek (dữ liệu tham khảo, không được sửa điểm):\n"
+                "Hai góc nhìn độc lập GLM/DeepSeek (dữ liệu tham khảo, không được sửa điểm):\n"
                 f"{council_block}\n\n"
                 if council_block
                 else ""
             )
             +
-            "Trả lời tiếng Việt ngắn gọn theo đúng 5 mục, mỗi mục 1–2 câu: "
-            "1) Chất lượng doanh nghiệp; 2) Định giá; 3) Mẫu hình và điều kiện xác nhận/hủy; "
-            "4) Vĩ mô theo hai chiều tích cực-rủi ro; 5) Điều còn thiếu cần kiểm chứng. "
+            "Trả lời tiếng Việt ngắn gọn theo đúng 4 mục, mỗi mục 1–2 câu: "
+            "1) Dữ kiện hiện tại đã kiểm chứng (ghi ngày và nói rõ nếu không có); "
+            "2) Điểm GLM và DeepSeek đồng thuận; 3) Mâu thuẫn hoặc lỗ hổng dữ liệu giữa hai góc nhìn; "
+            "4) Điều kiện cần theo dõi để xác nhận hoặc bác bỏ kịch bản quant. "
             "Không chèn bảng và không tự viết danh sách nguồn vì hệ thống sẽ gắn nguồn."
         )
 
@@ -2442,10 +2474,25 @@ class GeminiAnalyzer:
         return values
 
     @classmethod
-    def _validate_numeric_claims(cls, text: str, prompt: str) -> None:
-        """Reject any number that did not exist in deterministic input."""
+    def _validate_numeric_claims(
+        cls,
+        text: str,
+        prompt: str,
+        allow_grounded_updates: bool = False,
+    ) -> None:
+        """Protect immutable quant values while permitting sourced data-now facts."""
+
         allowed = cls._numeric_tokens(prompt)
-        for claim in cls._numeric_tokens(text):
+        checked_text = text
+        if allow_grounded_updates:
+            immutable_markers = re.compile(
+                r"(?:điểm\s+tổng|target|stop|\bT[123]\b|backtest|hit[- ]?rate|tỷ lệ thắng)",
+                re.IGNORECASE,
+            )
+            checked_text = "\n".join(
+                line for line in text.splitlines() if immutable_markers.search(line)
+            )
+        for claim in cls._numeric_tokens(checked_text):
             if not any(
                 math.isclose(claim, value, rel_tol=1e-9, abs_tol=1e-9)
                 or any(
@@ -2504,7 +2551,11 @@ class GeminiAnalyzer:
             raise RuntimeError("Gemini không trả về nội dung")
         if use_search and not sources:
             raise RuntimeError("Gemini Search returned no grounding sources")
-        self._validate_numeric_claims(text, prompt)
+        self._validate_numeric_claims(
+            text,
+            prompt,
+            allow_grounded_updates=bool(use_search and sources),
+        )
         self._validate_neutral_language(text)
         return self._with_sources(text, sources)
 
@@ -3426,6 +3477,11 @@ def backtest_similar_patterns(
     resolved = wins + losses
     hit_rate = wins / resolved * 100 if resolved >= 5 else None
     hit_rate_lower = _wilson_lower_percent(wins, resolved) if resolved >= 5 else None
+    target_trials = len(r_multiples)
+    target_hit_rate = wins / target_trials * 100 if target_trials >= 5 else None
+    target_hit_rate_lower = (
+        _wilson_lower_percent(wins, target_trials) if target_trials >= 5 else None
+    )
     positive_closes = sum(1 for item in net_returns if item > 0)
     positive_close_rate = (
         positive_closes / len(net_returns) * 100
@@ -3456,6 +3512,9 @@ def backtest_similar_patterns(
             history[index].date or f"index:{index}" for index in candidate_indices
         ),
         not_filled=not_filled,
+        target_trials=target_trials,
+        target_hit_rate=target_hit_rate,
+        target_hit_rate_lower=target_hit_rate_lower,
     )
 
 
@@ -3529,22 +3588,33 @@ def _format_backtest_horizon(label: str, result: BacktestResult) -> str:
     if result.samples == 0:
         return f"{label}: chưa có đủ lịch sử phù hợp."
     resolved = result.resolved or (result.wins + result.losses)
+    target_trials = result.target_trials or max(resolved, result.samples - result.not_filled)
+    target_rate = (
+        result.target_hit_rate
+        if result.target_hit_rate is not None
+        else result.hit_rate
+    )
+    target_lower = (
+        result.target_hit_rate_lower
+        if result.target_hit_rate_lower is not None
+        else result.hit_rate_lower
+    )
     trade_timeouts = max(0, result.unresolved - result.not_filled)
-    if result.hit_rate is None:
+    if target_rate is None:
         target_text = (
-            f"T1 trước stop: chưa đủ mẫu kết luận "
+            f"T1 trong kỳ: chưa đủ mẫu kết luận "
             f"({result.wins} đạt/{result.losses} dừng/{trade_timeouts} timeout; "
             f"{result.not_filled} không khớp entry)"
         )
     else:
         lower_text = (
-            f"; cận dưới Wilson 95% {result.hit_rate_lower:.1f}%"
-            if result.hit_rate_lower is not None
+            f"; cận dưới Wilson 95% {target_lower:.1f}%"
+            if target_lower is not None
             else ""
         )
         target_text = (
-            f"T1 trước stop {result.hit_rate:.1f}% "
-            f"({result.wins}/{resolved} mẫu đã ngã ngũ; "
+            f"T1 trước stop trong kỳ {target_rate:.1f}% "
+            f"({result.wins}/{target_trials} lệnh đã khớp; "
             f"{trade_timeouts} timeout, {result.not_filled} không khớp entry"
             f"{lower_text})"
         )
@@ -3571,6 +3641,82 @@ def _format_backtest_horizon(label: str, result: BacktestResult) -> str:
         f"{result.effective_samples or result.samples} mẫu hiệu dụng không chồng lấn, "
         f"{max(0, result.samples - result.not_filled)}/{result.samples} khớp entry."
     )
+
+
+def _shortlist_backtest(label: str, result: BacktestResult | None) -> str:
+    if result is None or result.samples <= 0:
+        return f"{label}: thiếu mẫu"
+    lower = getattr(result, "target_hit_rate_lower", None)
+    if lower is None:
+        lower = result.hit_rate_lower
+    lower_text = f"LCB {lower:.1f}%" if lower is not None else "LCB —"
+    expectancy_text = (
+        f"{result.expected_r:+.2f}R" if result.expected_r is not None else "—R"
+    )
+    filled = max(0, result.samples - result.not_filled)
+    return f"{label}: {lower_text} · kỳ vọng {expectancy_text} · khớp {filled}/{result.samples}"
+
+
+def _shortlist_item(signal: DeepSignal, rank: int) -> dict[str, Any]:
+    breakdown = signal.breakdown
+    lowers = []
+    expectations = []
+    for result in (signal.backtest, signal.backtest_3m):
+        if result is None:
+            continue
+        lower = getattr(result, "target_hit_rate_lower", None)
+        if lower is None:
+            lower = result.hit_rate_lower
+        if lower is not None:
+            lowers.append(float(lower))
+        if result.expected_r is not None:
+            expectations.append(float(result.expected_r))
+    return {
+        "rank": int(rank),
+        "symbol": signal.symbol,
+        "score": int(signal.score),
+        "data_quality": int(breakdown.data_quality if breakdown is not None else 0),
+        "robust_lcb": min(lowers) if len(lowers) == 2 else None,
+        "robust_expected_r": min(expectations) if len(expectations) == 2 else None,
+        "deep_analyzed": False,
+    }
+
+
+def format_scan_shortlist(
+    signals: list[DeepSignal],
+    date_key: str,
+    daily_limit: int = DEFAULT_DAILY_SHORTLIST_LIMIT,
+) -> str:
+    """Render the deterministic screening stage without touching any AI provider."""
+
+    chosen = signals[: max(1, min(int(daily_limit), DEFAULT_DAILY_SHORTLIST_LIMIT))]
+    lines = [
+        f"<b>SHORTLIST VN100 — {html.escape(date_key)}</b>",
+        "Sàng lọc sơ bộ định lượng · <b>0 lượt gọi AI</b> · tối đa 3 mã/ngày.",
+    ]
+    for rank, signal in enumerate(chosen, start=1):
+        breakdown = signal.breakdown
+        quality = breakdown.data_quality if breakdown is not None else 0
+        reasons = "; ".join(signal.reasons[:2]) or "đạt các gate định lượng"
+        lines.extend(
+            [
+                "",
+                f"<b>{rank}) {html.escape(signal.symbol)}</b> — "
+                f"{html.escape(signal.snapshot.name)} · <b>{signal.score}/100</b> · dữ liệu {quality}%",
+                html.escape(_shortlist_backtest("20 phiên", signal.backtest)),
+                html.escape(_shortlist_backtest("60 phiên", signal.backtest_3m)),
+                f"Lý do: {html.escape(_plain_excerpt(reasons, 240))}",
+                f"Phân tích sâu: <code>/deep {html.escape(signal.symbol)}</code>",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "<i>/scan chỉ chọn ứng viên. /deep mới gọi GLM, DeepSeek và Gemini; "
+            "score/target/stop vẫn do máy tính quyết định và không phải khuyến nghị mua/bán.</i>",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def format_deep_signal(
@@ -3624,10 +3770,8 @@ def format_deep_signal(
         else "OHLCV: chưa có lịch sử"
     )
     council_section = (
-        "<b>5) Phản biện GLM/DeepSeek (shadow)</b>\n"
-        f"{html.escape(_plain_excerpt(council_text, 900))}\n\n"
-        if council_text
-        else ""
+        "<b>5) Ba góc nhìn AI (shadow-only, không sửa quant)</b>\n"
+        f"{html.escape(_plain_excerpt(council_text, 1050))}\n\n"
     )
     prefix = (
         f"<b>DEEP 100 điểm: {html.escape(signal.symbol)}</b>\n"
@@ -3667,7 +3811,7 @@ def format_deep_signal(
         f"{source_line}\n\n"
         f"<b>Điểm cần chú ý:</b> {html.escape(_plain_excerpt(reasons, 520))}\n\n"
         f"{council_section}"
-        "<b>Góc nhìn Gemini:</b>\n"
+        "<b>Gemini — dữ liệu hiện tại &amp; tổng hợp:</b>\n"
     )
     suffix = (
         "\n\n<i>Điểm số và tỷ lệ trên là thống kê máy từ dữ liệu quá khứ, "
@@ -3775,22 +3919,58 @@ def _council_evidence(signal: DeepSignal) -> tuple[dict[str, Any], tuple[str, ..
 
 def _format_council_shadow(report: CouncilReport | None) -> str:
     if report is None or not report.enabled:
-        return ""
-    labels = {"glm": "GLM cơ bản", "deepseek": "DeepSeek phản biện"}
-    lines = [f"Council shadow: {report.status} (không sửa quyết định quant)."]
+        return (
+            "GLM — cơ bản & định giá: chưa cấu hình/không khả dụng.\n"
+            "DeepSeek — kỹ thuật & phản biện rủi ro: chưa cấu hình/không khả dụng."
+        )
+    labels = {
+        "glm": "GLM — cơ bản & định giá",
+        "deepseek": "DeepSeek — kỹ thuật & phản biện rủi ro",
+    }
+    actions = {
+        "billing": "hết số dư/gói tài nguyên — cần nạp hoặc gia hạn",
+        "insufficient_balance": "hết số dư/gói tài nguyên — cần nạp hoặc gia hạn",
+        "rate_limit": "đang giới hạn quota/tốc độ — hệ thống sẽ tự thử lại",
+        "rate_limited": "đang giới hạn quota/tốc độ — hệ thống sẽ tự thử lại",
+        "auth": "key bị từ chối — cần cập nhật secret",
+        "auth_error": "key bị từ chối — cần cập nhật secret",
+        "model": "model không khả dụng — cần kiểm tra cấu hình model",
+        "request": "provider từ chối tham số/model",
+        "server": "provider đang tạm gián đoạn",
+        "transport": "không kết nối được provider",
+        "timeout": "provider phản hồi quá chậm",
+        "cooldown": "đang trong thời gian nghỉ an toàn sau lỗi",
+        "disabled": "chưa cấu hình API key",
+    }
+    lines = [f"Trạng thái AI: {report.status}."]
     for review in report.reviews:
         opinion = review.opinion
-        detail = (
-            f"{labels.get(review.provider, review.provider)} — {review.status}/"
-            f"{opinion.verdict}, tự tin nội bộ {opinion.confidence:.0%}: "
-            f"{opinion.summary}"
-        )
+        failure_kind = str(getattr(review, "failure_kind", "") or "").lower()
+        successful = review.status == "ok" and opinion.verdict != "abstain"
+        if successful:
+            detail = (
+                f"{labels.get(review.provider, review.provider)} — {opinion.verdict}, "
+                f"tự tin nội bộ {opinion.confidence:.0%}: {opinion.summary}"
+            )
+        else:
+            action = actions.get(failure_kind) or actions.get(str(review.status).lower())
+            detail = (
+                f"{labels.get(review.provider, review.provider)} — "
+                f"{action or opinion.summary or 'không có phản hồi hợp lệ'}"
+            )
+            retry_after = getattr(review, "retry_after_seconds", None)
+            if (
+                isinstance(retry_after, int)
+                and retry_after > 0
+                and failure_kind in {"rate_limit", "server", "transport"}
+            ):
+                detail += f"; tự thử lại sau khoảng {max(1, math.ceil(retry_after / 60))} phút"
         if opinion.risks:
             detail += f" Rủi ro: {opinion.risks[0]}"
         if opinion.missing_data:
             detail += f" Thiếu: {opinion.missing_data[0]}"
         lines.append(detail)
-    lines.append("Độ tự tin model ở trên không phải xác suất thắng.")
+    lines.append("Độ tự tin nội bộ (nếu có) không phải xác suất thắng.")
     return _plain_excerpt("\n".join(lines), 1800)
 
 
@@ -3822,7 +4002,7 @@ class DeepSignalScanner:
         self.symbols = symbols
         self.macro_client = macro_client
         self.min_score = min_score
-        self.max_per_scan = max_per_scan
+        self.max_per_scan = max(1, min(int(max_per_scan), 3))
         self.max_workers = max(1, min(int(max_workers), 12))
         self.require_backtest = bool(require_backtest)
         self.min_backtest_resolved = max(1, int(min_backtest_resolved))
@@ -3888,7 +4068,7 @@ class DeepSignalScanner:
             return None
         if self.require_backtest:
             result = signal.backtest
-            resolved = result.resolved if result is not None else 0
+            target_trials = result.target_trials if result is not None else 0
             fill_rate = (
                 (result.samples - result.not_filled) / result.samples * 100.0
                 if result is not None and result.samples > 0
@@ -3896,9 +4076,9 @@ class DeepSignalScanner:
             )
             if (
                 result is None
-                or resolved < self.min_backtest_resolved
-                or result.hit_rate_lower is None
-                or result.hit_rate_lower < self.min_backtest_win_lower
+                or target_trials < self.min_backtest_resolved
+                or result.target_hit_rate_lower is None
+                or result.target_hit_rate_lower < self.min_backtest_win_lower
                 or result.expected_r is None
                 or result.expected_r < self.min_backtest_expectancy_r
                 or fill_rate < self.min_backtest_fill_rate
@@ -3907,12 +4087,33 @@ class DeepSignalScanner:
         return signal
 
     @staticmethod
-    def _rank_key(signal: DeepSignal) -> tuple[float, float, int]:
-        result = signal.backtest
+    def _rank_key(signal: DeepSignal) -> tuple[float, float, int, int, str]:
+        results = (signal.backtest, signal.backtest_3m)
+        robust_win_lower = min(
+            (
+                result.target_hit_rate_lower
+                if result is not None and result.target_hit_rate_lower is not None
+                else -1.0
+            )
+            for result in results
+        )
+        robust_expectancy = min(
+            (
+                result.expected_r
+                if result is not None and result.expected_r is not None
+                else -100.0
+            )
+            for result in results
+        )
+        data_quality = signal.breakdown.data_quality if signal.breakdown is not None else 0
+        # Sort ascending on this key: conservative cross-horizon metrics first,
+        # then current data quality/score, with the ticker as a stable tie-break.
         return (
-            result.hit_rate_lower if result and result.hit_rate_lower is not None else -1.0,
-            result.expected_r if result and result.expected_r is not None else -100.0,
-            signal.score,
+            -robust_win_lower,
+            -robust_expectancy,
+            -data_quality,
+            -signal.score,
+            signal.symbol,
         )
 
     def find_candidates(self) -> list[DeepSignal]:
@@ -3958,7 +4159,10 @@ class DeepSignalScanner:
                     continue
                 if candidate is not None:
                     candidates.append(candidate)
-        return sorted(candidates, key=self._rank_key, reverse=True)[: self.max_per_scan]
+        # The caller applies cooldowns before taking ``max_per_scan``. Returning
+        # the full qualified order lets a blocked top name be replaced by the
+        # next robust candidate without re-running the market-data scan.
+        return sorted(candidates, key=self._rank_key)
 
     def reviews_for(self, symbol: str) -> list[dict[str, Any]]:
         with self._council_lock:
@@ -3981,19 +4185,50 @@ class DeepSignalScanner:
 
     def council_status_text(self) -> str:
         if self.council is None or not self.council.enabled:
-            return "tắt/chưa đủ hai API key"
-        return "bật shadow-only (GLM + DeepSeek)"
+            return "tắt/chưa có API key GLM hoặc DeepSeek"
+        status_getter = getattr(self.council, "provider_statuses", None)
+        if not callable(status_getter):
+            return "bật shadow-only (GLM + DeepSeek)"
+        labels = {"glm": "GLM", "deepseek": "DeepSeek"}
+        failure_labels = {
+            "billing": "hết số dư",
+            "rate_limit": "quota/cooldown",
+            "auth": "key bị từ chối",
+            "model": "model không khả dụng",
+            "request": "yêu cầu bị từ chối",
+            "server": "provider gián đoạn",
+            "transport": "mất kết nối/timeout",
+        }
+        parts: list[str] = []
+        for provider, state in status_getter().items():
+            if not state.get("configured"):
+                text = "chưa key"
+            elif state.get("available"):
+                text = "sẵn sàng"
+            else:
+                text = failure_labels.get(str(state.get("failure_kind")), "đang cooldown")
+                retry_after = state.get("retry_after_seconds")
+                if isinstance(retry_after, int) and retry_after > 0:
+                    text += f", thử lại ~{max(1, math.ceil(retry_after / 60))} phút"
+            parts.append(f"{labels.get(provider, provider)}: {text}")
+        return " · ".join(parts)
 
     def render_signal(self, signal: DeepSignal, allow_burst: bool = False) -> str:
         report: CouncilReport | None = None
         council_context = ""
-        council_text = ""
+        council_text = _format_council_shadow(None)
         with self._council_lock:
             self._council_reports.pop(signal.symbol.upper(), None)
         if self.council is not None and self.council.enabled:
             try:
                 allowed = True
-                if self.council_usage_store is not None:
+                can_attempt_getter = getattr(self.council, "can_attempt", None)
+                can_attempt = (
+                    bool(can_attempt_getter())
+                    if callable(can_attempt_getter)
+                    else True
+                )
+                if can_attempt and self.council_usage_store is not None:
                     allowed, used, limit = self.council_usage_store.claim("council_reviews")
                     if not allowed:
                         council_text = (
@@ -4007,6 +4242,11 @@ class DeepSignalScanner:
                         self._council_reports[signal.symbol.upper()] = report
                     council_payload = report.to_dict()
                     council_payload.pop("cache_hit", None)
+                    council_payload["reviews"] = [
+                        review
+                        for review in council_payload.get("reviews", [])
+                        if isinstance(review, dict) and review.get("status") == "ok"
+                    ]
                     council_context = json.dumps(
                         council_payload,
                         ensure_ascii=False,
@@ -4147,14 +4387,14 @@ HELP = (
     "/report <code>FPT</code> — báo cáo nhanh: giá, cao/thấp, khối lượng\n"
     "/chart <code>FPT</code> — biểu đồ chữ 30 phiên\n"
     "/ta <code>FPT</code> — MA5, MA20, RSI14, hỗ trợ/kháng cự\n"
-    "/deep <code>FPT</code> — doanh nghiệp, định giá, mẫu hình, điểm 100, target/stop và backtest\n"
+    "/deep <code>FPT</code> — phân tích sâu: quant + GLM + DeepSeek + Gemini\n"
     "/news <code>FPT</code> — phân tích tin doanh nghiệp/chủ đề theo hai chiều, có nguồn\n"
     "/new <code>FPT</code> — bí danh ngắn của /news, chỉ giữ tin đúng mã/doanh nghiệp\n"
     "/macro — tin và trạng thái vĩ mô trung lập từ vimo-VN\n"
-    "/signals_on — nhận tín hiệu lọc sâu VN100\n"
+    "/signals_on — nhận shortlist định lượng VN100\n"
     "/signals_off — tắt tín hiệu lọc sâu\n"
     "/signals_status — trạng thái nhận tín hiệu\n"
-    "/scan — quét VN100 ngay\n"
+    "/scan — sàng lọc sơ bộ VN100, tối đa 3 mã, không gọi AI\n"
     "/market — VN-Index\n"
     "/add <code>FPT</code> — thêm vào danh sách theo dõi\n"
     "/remove <code>FPT</code> — xóa khỏi danh sách\n"
@@ -4269,12 +4509,12 @@ class BotApplication:
         usage_store: ApiUsageStore | None = None,
         macro_client: MacroContextClient | None = None,
         news_service: NeutralNewsService | None = None,
-        monthly_signal_limit: int = DEFAULT_MONTHLY_SIGNAL_LIMIT,
-        signal_cooldown_days: int = DEFAULT_SIGNAL_COOLDOWN_DAYS,
+        daily_shortlist_limit: int = DEFAULT_DAILY_SHORTLIST_LIMIT,
         research_command_cooldown: float = DEFAULT_RESEARCH_COMMAND_COOLDOWN,
         outcome_ledger: SignalLedger | None = None,
         outcome_timeout_sessions: int = 20,
         outcome_cost_bps: float = DEFAULT_BACKTEST_COST_PCT * 100.0,
+        allowed_chat_ids: Iterable[str | int] | None = None,
     ):
         self.telegram = telegram
         self.provider = provider
@@ -4284,12 +4524,19 @@ class BotApplication:
         self.usage_store = usage_store
         self.macro_client = macro_client
         self.news_service = news_service
-        self.monthly_signal_limit = monthly_signal_limit
-        self.signal_cooldown_days = signal_cooldown_days
+        self.daily_shortlist_limit = max(
+            1,
+            min(int(daily_shortlist_limit), DEFAULT_DAILY_SHORTLIST_LIMIT),
+        )
         self.research_command_cooldown = max(0.0, float(research_command_cooldown))
         self.outcome_ledger = outcome_ledger
         self.outcome_timeout_sessions = max(1, int(outcome_timeout_sessions))
         self.outcome_cost_bps = max(0.0, float(outcome_cost_bps))
+        self.allowed_chat_ids = frozenset(
+            str(item).strip()
+            for item in (allowed_chat_ids or ())
+            if str(item).strip()
+        )
         self._research_last_started_at = 0.0
         self._research_lock = threading.Lock()
 
@@ -4316,7 +4563,7 @@ class BotApplication:
     @staticmethod
     def _research_cooldown_message(remaining: int) -> str:
         return (
-            f"Để tránh vượt giới hạn API, /deep, /scan và /news chỉ chạy một lần mỗi phút. "
+            f"Để tránh vượt giới hạn API, /deep, /scan và /news có thời gian nghỉ giữa các lượt. "
             f"Hãy thử lại sau {remaining} giây. /ping và /quote vẫn hoạt động bình thường."
         )
 
@@ -4425,6 +4672,9 @@ class BotApplication:
             return
         chat_id = chat.get("id")
         if chat_id is None:
+            return
+        if self.allowed_chat_ids and str(chat_id) not in self.allowed_chat_ids:
+            # Silently ignore unknown chats so they cannot probe the bot or burn API quota.
             return
         response = self.handle_text(str(text), chat_id)
         if response:
@@ -4557,16 +4807,26 @@ class BotApplication:
                 )
                 if not isinstance(scanner_cost, (int, float)):
                     scanner_cost = DEFAULT_BACKTEST_COST_PCT
-                return scanner.render_signal(
-                    build_deep_signal(
-                        symbol,
-                        snapshot,
-                        quote,
-                        bars,
-                        macro,
-                        backtest_cost_pct=float(scanner_cost),
-                    )
+                signal = build_deep_signal(
+                    symbol,
+                    snapshot,
+                    quote,
+                    bars,
+                    macro,
+                    backtest_cost_pct=float(scanner_cost),
                 )
+                rendered = scanner.render_signal(signal)
+                if (
+                    self.signal_store is not None
+                    and self.signal_store.claim_shortlist_deep(
+                        ApiUsageStore._today(),
+                        signal.symbol,
+                    )
+                ):
+                    # Only user-confirmed deep analysis of a system shortlist is
+                    # recorded as a live signal. Screening alone is never a trade.
+                    self._record_live_signal(signal)
+                return rendered
             if command in {"/news", "/new", "/tintuc", "/macro"}:
                 argument = _argument(text)
                 if command != "/macro" and not argument:
@@ -4646,21 +4906,17 @@ class BotApplication:
                 )
                 council_status = self._scanner_council_status()
                 return (
-                    f"Tín hiệu: {'đang bật' if enabled else 'đang tắt'}\n"
+                    f"Shortlist: {'đang bật' if enabled else 'đang tắt'}\n"
                     f"Gemini: {gemini_status}\n"
                     f"Council: {council_status}\n"
-                    f"Giới hạn: tối đa {self.monthly_signal_limit} mã/tháng\n"
-                    f"Cooldown mỗi mã: {self.signal_cooldown_days} ngày\n"
+                    f"Giới hạn: tối đa {self.daily_shortlist_limit} mã/ngày; /scan không gọi AI\n"
                     f"Lần quét cuối: {self.signal_store.last_scan_date() or 'chưa có'}"
                 )
             if command == "/scan":
                 remaining = self._claim_research_slot()
                 if remaining:
                     return self._research_cooldown_message(remaining)
-                daily_limit = self._claim_daily_command("scan_commands", "/scan")
-                if daily_limit:
-                    return daily_limit
-                return self.run_signal_scan(manual=True) or "Không có tín hiệu đủ sâu trong lần quét này."
+                return self.run_signal_scan(manual=True) or "Không có mã nào vượt gate sơ bộ trong lần quét này."
             if command == "/market":
                 return format_quote(self.provider.get_quote("VNINDEX"))
             if command == "/add":
@@ -4708,35 +4964,68 @@ class BotApplication:
         if not self.signal_store or not self.scanner:
             return "Tính năng tín hiệu chưa được cấu hình."
         self._refresh_live_outcomes()
-        chats = self.signal_store.chats()
+        chats = [
+            chat
+            for chat in self.signal_store.chats()
+            if not self.allowed_chat_ids or str(chat) in self.allowed_chat_ids
+        ]
         if not chats and not manual:
             return None
-        now = datetime.now()
-        remaining = self.monthly_signal_limit - self.signal_store.sent_this_month(now)
+        daily_limit_message = self._claim_daily_command("scan_commands", "/scan")
+        if daily_limit_message:
+            return daily_limit_message if manual else None
+        date_key = ApiUsageStore._today()
+        existing = self.signal_store.shortlist(date_key)
+        remaining = self.daily_shortlist_limit - len(existing)
         if remaining <= 0:
-            return "Tháng này đã đủ số tín hiệu theo giới hạn."
-        candidates = self.scanner.find_candidates()
-        messages: list[str] = []
-        for candidate in candidates:
-            if len(messages) >= remaining:
-                break
-            if self.signal_store.recently_sent(candidate.symbol, now, self.signal_cooldown_days):
-                continue
-            messages.append(
-                self.scanner.render_signal(candidate, allow_burst=bool(messages))
+            message = (
+                f"Hôm nay đã đủ {self.daily_shortlist_limit} mã trong shortlist. "
+                "Dùng /deep <mã> để bóc tách sâu."
             )
-            self.signal_store.record_sent(candidate.symbol, now)
-            self._record_live_signal(candidate)
-        if manual and not messages:
-            return "Quét xong: chưa có mã VN100 nào đạt ngưỡng chiết khấu đủ sâu."
-        for message in messages:
-            for chat_id in chats:
-                try:
-                    self.telegram.send_message(chat_id, message)
-                except BotError as exc:
-                    LOG.warning("Cannot send signal to %s: %s", chat_id, exc)
+            return message if manual else None
+        candidates = self.scanner.find_candidates()
+        chosen: list[DeepSignal] = []
+        configured_scan_cap = getattr(
+            self.scanner,
+            "max_per_scan",
+            self.daily_shortlist_limit,
+        )
+        if not isinstance(configured_scan_cap, int):
+            configured_scan_cap = self.daily_shortlist_limit
+        selection_limit = min(
+            remaining,
+            max(1, min(configured_scan_cap, DEFAULT_DAILY_SHORTLIST_LIMIT)),
+        )
+        existing_symbols = {
+            str(item.get("symbol") or "").upper()
+            for item in existing
+            if isinstance(item, dict)
+        }
+        for candidate in candidates:
+            if len(chosen) >= selection_limit:
+                break
+            if candidate.symbol.upper() in existing_symbols:
+                continue
+            chosen.append(candidate)
+        if not chosen:
+            return (
+                "Quét xong: chưa có mã VN100 nào vượt đủ gate định lượng và cooldown."
+                if manual
+                else None
+            )
+        items = [
+            _shortlist_item(candidate, len(existing) + rank)
+            for rank, candidate in enumerate(chosen, start=1)
+        ]
+        self.signal_store.save_shortlist(date_key, items)
+        message = format_scan_shortlist(chosen, date_key, self.daily_shortlist_limit)
         if manual:
-            return "\n\n".join(messages)
+            return message
+        for chat_id in chats:
+            try:
+                self.telegram.send_message(chat_id, message)
+            except BotError as exc:
+                LOG.warning("Cannot send shortlist to %s: %s", chat_id, exc)
         return None
 
 
@@ -4788,9 +5077,12 @@ def build_application() -> BotApplication:
         poll_timeout = float(os.environ.get("POLL_TIMEOUT", DEFAULT_POLL_TIMEOUT))
         yahoo_timeout = float(os.environ.get("YAHOO_TIMEOUT", DEFAULT_YAHOO_TIMEOUT))
         min_signal_score = int(os.environ.get("MIN_SIGNAL_SCORE", "70"))
-        max_signals_per_scan = int(os.environ.get("MAX_SIGNALS_PER_SCAN", "2"))
-        monthly_signal_limit = int(os.environ.get("MONTHLY_SIGNAL_LIMIT", DEFAULT_MONTHLY_SIGNAL_LIMIT))
-        signal_cooldown_days = int(os.environ.get("SIGNAL_COOLDOWN_DAYS", DEFAULT_SIGNAL_COOLDOWN_DAYS))
+        max_signals_per_scan = int(
+            os.environ.get("MAX_SIGNALS_PER_SCAN", DEFAULT_DAILY_SHORTLIST_LIMIT)
+        )
+        daily_shortlist_limit = int(
+            os.environ.get("DAILY_SHORTLIST_LIMIT", DEFAULT_DAILY_SHORTLIST_LIMIT)
+        )
         scan_workers = int(os.environ.get("SCAN_WORKERS", DEFAULT_SCAN_WORKERS))
         research_command_cooldown = float(
             os.environ.get(
@@ -4875,6 +5167,17 @@ def build_application() -> BotApplication:
         )
     except ValueError as exc:
         raise ValueError("Các biến timeout/score/limit phải là số.") from exc
+    allowed_chat_raw = (
+        os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "").strip()
+        or os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    )
+    allowed_chat_ids = [
+        item
+        for item in re.split(r"[\s,;]+", allowed_chat_raw)
+        if item
+    ]
+    if any(re.fullmatch(r"-?\d+", item) is None for item in allowed_chat_ids):
+        raise ValueError("TELEGRAM_ALLOWED_CHAT_IDS chỉ được chứa chat ID dạng số.")
     telegram = TelegramClient(token, timeout=max(10.0, poll_timeout + 10.0))
     usage_store = ApiUsageStore(
         data_dir / "api_usage.json",
@@ -4948,9 +5251,9 @@ def build_application() -> BotApplication:
             ),
             max_history_staleness_days=max_history_staleness_days,
         ),
-        monthly_signal_limit=monthly_signal_limit,
-        signal_cooldown_days=signal_cooldown_days,
+        daily_shortlist_limit=daily_shortlist_limit,
         research_command_cooldown=research_command_cooldown,
+        allowed_chat_ids=allowed_chat_ids,
     )
 
 

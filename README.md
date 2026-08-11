@@ -12,8 +12,9 @@ DeepSeek là các lớp nghiên cứu tùy chọn, không được quyền sửa
 - `/report FPT`: báo cáo nhanh gồm giá, mở cửa, cao/thấp phiên và khối lượng
 - `/chart FPT`: biểu đồ chữ 30 phiên để xem nhanh trong Telegram
 - `/ta FPT`: MA5, MA20, RSI14, hỗ trợ/kháng cự gần
-- `/deep FPT`: cấu trúc doanh nghiệp, định giá, mẫu hình, điểm 100, target/stop
-  theo kịch bản và backtest trạng thái tương tự
+- `/deep FPT`: nghiên cứu sâu tối đa 3 lượt/ngày; GLM kiểm tra chất lượng doanh
+  nghiệp, DeepSeek phản biện rủi ro và Gemini tổng hợp/bổ sung dữ liệu hiện tại.
+  Ba lớp AI chỉ diễn giải evidence, không sửa điểm 100, target/stop hay backtest
 - `/news FPT` hoặc `/news Thông tư 14/2026`: phân tích tiêu đề theo hai chiều,
   luôn gắn nguồn và nêu phần chưa thể xác nhận
 - `/new FPT`: bí danh ngắn của `/news FPT`; khi đầu vào là một mã, bot lấy thêm
@@ -25,7 +26,8 @@ DeepSeek là các lớp nghiên cứu tùy chọn, không được quyền sửa
 - `/performance`: cập nhật và xem win/loss/timeout, expectancy R và lợi nhuận
   ròng của chính các tín hiệu live đã được bot ghi sổ
 - `/signals_on`, `/signals_off`, `/signals_status`: bật/tắt tín hiệu lọc sâu VN100
-- `/scan`: quét VN100 ngay, mặc định chỉ gửi mã đạt ngưỡng đủ sâu
+- `/scan`: shortlist VN100 thuần định lượng, không gọi Gemini/GLM/DeepSeek và chỉ
+  trả tối đa 3 mã đạt toàn bộ gate trong ngày
 - `/market`: VN-Index
 - `/add FPT`, `/remove FPT`: quản lý danh sách theo dõi theo từng cuộc trò chuyện
 - `/watchlist`, `/watch`: xem và lấy giá danh sách theo dõi
@@ -53,16 +55,20 @@ khuyến nghị đầu tư.
 
    ```powershell
    $env:TELEGRAM_BOT_TOKEN = "<TOKEN_MỚI>"
+   $env:TELEGRAM_ALLOWED_CHAT_IDS = "<CHAT_ID_CỦA_BẠN>"
    $env:GEMINI_API_KEY = "<KEY_GEMINI_THẬT>"
    $env:VNSTOCK_API_KEY = "<KEY_VNSTOCK_THẬT>"
-   # Chỉ thêm hai key sau khi muốn bật council tùy chọn:
+   # Thêm một hoặc cả hai key khi muốn bật council tùy chọn:
    $env:GLM_API_KEY = "<KEY_GLM_THẬT>"
    $env:DEEPSEEK_API_KEY = "<KEY_DEEPSEEK_THẬT>"
    $env:MODEL_COUNCIL_ENABLED = "true"
    ```
 
-   Lưu ý: `os.environ.get("GEMINI_API_KEY")` chỉ là lệnh đọc biến môi trường,
-   không phải API key. Key thật là chuỗi được tạo trong Google AI Studio.
+   `TELEGRAM_ALLOWED_CHAT_IDS` nhận một hoặc nhiều chat ID nguyên, phân tách bằng
+   dấu phẩy; nếu để trống, bot dùng `TELEGRAM_CHAT_ID` làm fallback tương thích.
+   Người ngoài allowlist không được dùng lệnh để tiêu hao quota. Lưu ý:
+   `os.environ.get("GEMINI_API_KEY")` chỉ là lệnh đọc biến môi trường, không phải
+   API key. Key thật là chuỗi được tạo trong Google AI Studio.
 
 4. Chạy bot:
 
@@ -88,9 +94,10 @@ Các biến tùy chọn: `POLL_TIMEOUT`, `YAHOO_TIMEOUT`, `DATA_DIR`, `LOG_LEVEL
 
 ## Tín hiệu lọc sâu VN100
 
-Bot có thể tự quét rổ VN100 mặc định 2 lần/tuần và chỉ gửi tối đa vài tín hiệu
-mỗi tháng. TradingView được gọi theo lô, còn dữ liệu lịch sử được lấy song song
-có giới hạn. Khung điểm 100 cố định, Gemini chỉ giải thích và không được sửa:
+Bot có thể tự quét rổ VN100 mặc định 2 lần/tuần. Mỗi ngày scanner chỉ tạo một
+shortlist thuần định lượng, tối đa 3 mã vượt đủ gate; `/scan` tuyệt đối không gọi
+Gemini, GLM hay DeepSeek. TradingView được gọi theo lô, còn dữ liệu lịch sử được
+lấy song song có giới hạn. Khung điểm 100 cố định:
 
 - Chất lượng doanh nghiệp: `30` điểm — tăng trưởng doanh thu/lợi nhuận, ROE,
   đòn bẩy và thanh toán hiện hành
@@ -110,9 +117,10 @@ Gap qua stop khớp ở open xấu hơn; cùng nến chạm cả target và stop
 trước.
 
 Mỗi khung 20/60 phiên hiển thị hit-rate mô tả, cận dưới Wilson 95%, số mẫu hiệu
-dụng, lợi nhuận ròng trung vị và expectancy theo R. Scanner production mặc định
-chỉ xét khung 20 phiên và phải vượt đồng thời score, số mẫu, cận dưới Wilson và
-expectancy; khung 60 phiên chỉ để tham khảo. Đây vẫn không phải xác suất thắng
+dụng, lợi nhuận ròng trung vị và expectancy theo R. Gate production mặc định yêu
+cầu khung 20 phiên vượt đồng thời score, số lệnh đã khớp (kể cả timeout), cận dưới
+Wilson và expectancy. Sau gate, thứ hạng dùng giá trị yếu hơn giữa cả khung 20 và
+60 phiên để tránh chọn mã chỉ đẹp ở một horizon. Đây vẫn không phải xác suất thắng
 tương lai hay kiểm định walk-forward toàn thị trường.
 
 Lệnh Telegram:
@@ -142,7 +150,8 @@ Biến cấu hình:
 - `GEMINI_QUOTA_COOLDOWN`: khi gặp 429, ngừng gọi Gemini trong `900` giây
 - `RESEARCH_COMMAND_COOLDOWN`: `/deep`, `/scan` và `/news` cách nhau ít nhất `60` giây;
   `/ping`, `/quote` và các lệnh thường không bị ảnh hưởng
-- `GEMINI_DAILY_BUDGET`: ngân sách an toàn nội bộ, mặc định `12` API call/ngày
+- `GEMINI_DAILY_BUDGET`: ngân sách an toàn nội bộ, mặc định `6` API call/ngày;
+  đủ cho tối đa 3 lệnh `/deep` khi mỗi lệnh có nhiều nhất một fallback Gemini
 - `VNSTOCK_API_KEY`: key VNStock; bot tự ánh xạ thêm sang `VNDATA_API_KEY`
 - `VNSTOCK_SOURCES`: thứ tự nguồn cho phép, mặc định `VCI,KBS`; thứ tự thực tế được
   xoay theo mã để chia tải
@@ -151,8 +160,9 @@ Biến cấu hình:
 - `VNSTOCK_USAGE_RATIO`: chỉ dùng `70%` trần trên, tức `8.4` lần/phút/nguồn
 - `VNSTOCK_ERROR_COOLDOWN`: nghỉ nguồn `300` giây khi gặp 429/quota
 - `VNSTOCK_CACHE_TTL`: cache lịch sử mỗi mã `480` giây
-- `DEEP_DAILY_LIMIT`: tối đa `10` lệnh `/deep` được nhận mỗi ngày
-- `SCAN_DAILY_LIMIT`: tối đa `2` lệnh `/scan` thủ công mỗi ngày
+- `DEEP_DAILY_LIMIT`: tối đa `3` lệnh `/deep` được nhận mỗi ngày
+- `SCAN_DAILY_LIMIT`: tối đa `1` lượt shortlist `/scan` mỗi ngày; scanner không
+  tiêu ngân sách của Gemini, GLM hoặc DeepSeek
 - `NEWS_DAILY_LIMIT`: tối đa `8` lệnh `/news` hoặc `/macro` mỗi ngày
 - `VIMO_LATEST_URL`: mặc định đọc `vimo-VN/output/latest.json`
 - `VIMO_CACHE_TTL`: cache vĩ mô `900` giây
@@ -162,10 +172,11 @@ Biến cấu hình:
 - `SCAN_WEEKDAYS`: ngày quét, định dạng số thứ trong tuần của Python; mặc định `0,3` là thứ Hai và thứ Năm
 - `SCAN_TIME`: giờ quét theo giờ máy, mặc định `20:30`
 - `SCAN_WORKERS`: mặc định `2`, tối đa nội bộ `12`; giảm tải đồng thời lên nguồn giá
-- `MONTHLY_SIGNAL_LIMIT`: mặc định `2`
-- `MAX_SIGNALS_PER_SCAN`: mặc định `2`
+- `DAILY_SHORTLIST_LIMIT`: trần tổng tối đa `3` mã shortlist được phát mỗi ngày,
+  dùng chung cho scan thủ công và scan theo lịch
+- `MAX_SIGNALS_PER_SCAN`: mặc định `3`; kết hợp với một lượt scan/ngày để giữ
+  shortlist không quá 3 mã/ngày
 - `MIN_SIGNAL_SCORE`: mặc định `70`
-- `SIGNAL_COOLDOWN_DAYS`: mặc định `30`
 - `VN100_SYMBOLS`: danh sách mã override, phân tách bằng dấu phẩy nếu rổ VN100 thay đổi
 - `SIGNAL_REQUIRE_BACKTEST`: mặc định `true`; bật gate thống kê cho scanner tự động
 - `SIGNAL_REQUIRE_DATED_HISTORY`: mặc định `true`; không phát signal tự động nếu
@@ -181,23 +192,29 @@ Biến cấu hình:
 
 Tín hiệu này là bộ lọc nghiên cứu tự động, không phải khuyến nghị mua/bán.
 
-Gemini chỉ là lớp diễn giải. Khi bật Search mà phản hồi không có nguồn grounding,
-hoặc phản hồi chứa số không có trong dữ liệu deterministic đầu vào, nội dung đó
-bị loại; bot vẫn tiếp tục với kết quả chấm điểm gốc. Cache Gemini được fingerprint
+Gemini chỉ là lớp diễn giải. Khi tắt Search, số không có trong đầu vào deterministic
+bị loại. Khi bật Search, dữ kiện hiện tại mới chỉ được phép xuất hiện nếu phản hồi
+có nguồn grounding; các số thuộc score, target/stop và backtest vẫn phải khớp đầu
+vào. Bot luôn tiếp tục với kết quả chấm điểm gốc. Cache Gemini được fingerprint
 theo toàn bộ facts/model/prompt/Search thay vì chỉ theo mã. Fallback được phép bỏ
 qua local interval đúng một lần nhưng vẫn chịu daily budget và circuit breaker.
 Google Search chỉ bổ sung sự kiện/tin có nguồn; giá, OHLCV và số dùng để gate luôn
 lấy từ provider có timestamp, không lấy từ snippet web.
 
-## Council GLM + DeepSeek (tùy chọn, API điền sau)
+## `/deep`: ba vai trò Gemini + GLM + DeepSeek
 
-Mặc định hai API key để trống nên clone chạy quant-only và không gọi provider.
-`MODEL_COUNCIL_ENABLED=false` là kill switch; khi có đủ cả hai key và flag không
-bị tắt, backend gửi cùng một evidence snapshot bất biến
-cho GLM (chất lượng doanh nghiệp) và DeepSeek (phản biện rủi ro) song song qua API
+Mặc định các API key để trống nên clone chạy quant-only và không gọi provider.
+`MODEL_COUNCIL_ENABLED=false` là kill switch; mỗi key bật độc lập provider tương
+ứng. Khi có cả hai key, backend gửi cùng một evidence snapshot bất biến cho GLM
+(chất lượng doanh nghiệp) và DeepSeek (phản biện rủi ro) song song qua API
 OpenAI-compatible. Mỗi model chỉ được trả JSON hẹp gồm verdict, confidence nội bộ,
 evidence ID, rủi ro và dữ liệu còn thiếu. Timeout, JSON sai hoặc thiếu key đều trở
 thành `abstain`; không làm scanner dừng.
+
+Chỉ `/deep` dùng ba API: GLM đánh giá dữ kiện cơ bản, DeepSeek tìm phản chứng/rủi
+ro, sau đó Gemini tổng hợp hai phản biện cùng dữ liệu định lượng và có thể bổ sung
+sự kiện hiện tại khi Google Search grounding được bật. `/scan` không đi qua đường
+này, vì vậy lỗi hoặc hết số dư AI không ảnh hưởng shortlist định lượng.
 
 Council hiện chạy **shadow-only**: kết quả được lưu cùng signal ledger và đưa cho
 Gemini để tổng hợp, nhưng không thay đổi score, target/stop, gate backtest hoặc
@@ -211,8 +228,10 @@ Biến cấu hình:
 - `DEEPSEEK_BASE_URL=https://api.deepseek.com`, `DEEPSEEK_MODEL=deepseek-v4-flash`
 - `MODEL_COUNCIL_REQUEST_TIMEOUT=20`, `MODEL_COUNCIL_OVERALL_TIMEOUT=22`
 - `MODEL_COUNCIL_MAX_OUTPUT_TOKENS=800`, `MODEL_COUNCIL_CACHE_TTL=900`
-- `MODEL_COUNCIL_DAILY_BUDGET=4`: tối đa bốn lượt council/ngày; mỗi lượt gọi
+- `MODEL_COUNCIL_DAILY_BUDGET=3`: tối đa ba lượt council/ngày; mỗi lượt gọi
   đồng thời một GLM và một DeepSeek
+- `MODEL_COUNCIL_ERROR_COOLDOWN=900`: sau lỗi provider, tạm nghỉ provider đó
+  `900` giây để tránh lặp lại lỗi quota/billing
 
 Endpoint GLM trên là Z.AI quốc tế. Nếu API key được tạo trên BigModel Trung Quốc,
 đổi `GLM_BASE_URL` thành `https://open.bigmodel.cn/api/paas/v4`.
@@ -257,8 +276,12 @@ long polling và runner trả kết quả về cuộc trò chuyện.
 5. Hết thời gian bot tự dừng. Có thể bấm **Cancel workflow** để dừng sớm.
 
 Khi muốn bật council sau này, vào **Settings → Secrets and variables → Actions**,
-thêm hai repository secret `GLM_API_KEY` và `DEEPSEEK_API_KEY`. Workflow đã có
+thêm một hoặc cả hai repository secret `GLM_API_KEY` và `DEEPSEEK_API_KEY`. Workflow đã có
 base URL/model/budget; không đưa key vào `.env.example`, source code hoặc log.
+Giữ `TELEGRAM_CHAT_ID` hiện có để làm allowlist một người, hoặc thêm secret
+`TELEGRAM_ALLOWED_CHAT_IDS` chứa nhiều chat ID phân tách bằng dấu phẩy. Workflow
+ưu tiên allowlist mới và tự fallback về `TELEGRAM_CHAT_ID`; job sẽ dừng sớm nếu
+không có allowlist hợp lệ.
 Để Gemini bổ sung sự kiện hiện tại có grounding, tạo thêm repository variable
 `GEMINI_GOOGLE_SEARCH=true`; nếu không, workflow giữ chế độ định lượng tiết kiệm quota.
 
@@ -277,7 +300,7 @@ TradingView và RSS có thể thiếu/chậm; tiêu đề không thay thế nộ
 thông thường; bot giữ điểm trung tính và nhắc so sánh theo ngành. Target/stop chỉ
 là kịch bản theo ATR/hỗ trợ gần để chuẩn hóa rủi ro, không phải mức giá bảo đảm.
 
-Score v2 sửa trường hợp P/E/P/B âm bị cộng điểm, trừ điểm CFO/FCF âm ở doanh
+Score v2.1 sửa trường hợp P/E/P/B âm bị cộng điểm, trừ điểm CFO/FCF âm ở doanh
 nghiệp phi tài chính và giảm độ tin cậy khi thiếu trường lõi. Score vẫn là heuristic
 có thể audit, chưa phải xác suất đã calibrate. Cận Wilson và expectancy làm gate
 bảo thủ hơn nhưng không loại được survivorship bias, dữ liệu tài chính không

@@ -16,7 +16,9 @@ from bot import (
     PriceBar,
     Quote,
     SignalStore,
+    TradePlan,
     WatchlistStore,
+    backtest_similar_patterns,
     build_deep_signal,
 )
 from model_council import CouncilConfig, ModelCouncil
@@ -110,7 +112,10 @@ class V2IntegrationTests(unittest.TestCase):
                 council_usage_store=usage,
             )
             rendered = scanner.render_signal(signal)
-            self.assertIn("GLM/DeepSeek", rendered)
+            self.assertIn("Ba góc nhìn AI", rendered)
+            self.assertIn("GLM — cơ bản &amp; định giá", rendered)
+            self.assertIn("DeepSeek — kỹ thuật &amp; phản biện rủi ro", rendered)
+            self.assertIn("Gemini — dữ liệu hiện tại", rendered)
             self.assertIn('"reviews"', gemini.contexts[0])
             self.assertIn('"support"', gemini.contexts[0])
             self.assertEqual(glm.calls, 1)
@@ -173,11 +178,19 @@ class V2IntegrationTests(unittest.TestCase):
                 effective_samples=10,
                 hit_rate_lower=40.0,
                 expected_r=0.5,
+                target_trials=10,
+                target_hit_rate=60.0,
+                target_hit_rate_lower=40.0,
             ),
         )
         strong = replace(
             weak,
-            backtest=replace(weak.backtest, hit_rate_lower=50.0, expected_r=0.10),
+            backtest=replace(
+                weak.backtest,
+                hit_rate_lower=50.0,
+                expected_r=0.10,
+                target_hit_rate_lower=50.0,
+            ),
         )
         provider = Mock()
         provider.get_quote.return_value = signal.quote
@@ -197,6 +210,110 @@ class V2IntegrationTests(unittest.TestCase):
         with patch("bot.build_deep_signal", return_value=strong):
             self.assertIs(scanner._evaluate("FPT", signal.snapshot, signal.macro), strong)
         provider.get_history.assert_called_with("FPT", range_value="5y", interval="1d")
+
+    def test_target_trials_count_filled_timeouts_as_non_wins(self):
+        start = date(2025, 1, 1)
+        bars = [
+            PriceBar(
+                close=100.0,
+                open_price=100.0,
+                high=100.5,
+                low=99.5,
+                volume=1_000_000,
+                date=(start + timedelta(days=index)).isoformat(),
+            )
+            for index in range(200)
+        ]
+        plan = TradePlan(
+            entry_low=99.0,
+            entry_high=101.0,
+            stop=90.0,
+            target_1=110.0,
+            target_2=120.0,
+            target_3=130.0,
+            risk_pct=10.0,
+        )
+        with patch("bot._market_signature", return_value=(1, 1, 1, 1)), patch(
+            "bot.build_trade_plan", return_value=plan
+        ):
+            result = backtest_similar_patterns(bars, plan, lookahead_sessions=20)
+
+        self.assertGreaterEqual(result.samples, 5)
+        self.assertEqual(result.resolved, 0)
+        self.assertEqual(result.not_filled, 0)
+        self.assertEqual(result.target_trials, result.samples)
+        self.assertEqual(result.target_hit_rate, 0.0)
+        self.assertEqual(result.target_hit_rate_lower, 0.0)
+
+    def test_rank_uses_worst_horizon_and_symbol_tie_break(self):
+        base = signal_fixture("AAA")
+
+        def result(lower: float, expectancy: float) -> BacktestResult:
+            return BacktestResult(
+                samples=10,
+                wins=6,
+                losses=2,
+                unresolved=2,
+                hit_rate=75.0,
+                resolved=8,
+                hit_rate_lower=50.0,
+                expected_r=expectancy,
+                target_trials=10,
+                target_hit_rate=60.0,
+                target_hit_rate_lower=lower,
+            )
+
+        one_horizon_wonder = replace(
+            base,
+            symbol="ZZZ",
+            backtest=result(70.0, 0.8),
+            backtest_3m=result(20.0, 0.8),
+        )
+        balanced = replace(
+            base,
+            symbol="BBB",
+            backtest=result(55.0, 0.3),
+            backtest_3m=result(50.0, 0.3),
+        )
+        tied_aaa = replace(balanced, symbol="AAA")
+        scanner = DeepSignalScanner(Mock(), RecordingGemini(), [], max_per_scan=99)
+
+        ranked = sorted(
+            [one_horizon_wonder, balanced, tied_aaa],
+            key=scanner._rank_key,
+        )
+        self.assertEqual([item.symbol for item in ranked], ["AAA", "BBB", "ZZZ"])
+        self.assertEqual(scanner.max_per_scan, 3)
+
+    def test_find_candidates_returns_full_order_for_cooldown_backfill(self):
+        symbols = ["AAA", "BBB", "CCC", "DDD"]
+        base = signal_fixture()
+        candidates = {
+            symbol: replace(base, symbol=symbol, score=70 + index)
+            for index, symbol in enumerate(symbols)
+        }
+        provider = Mock()
+        provider.get_fundamentals_batch.return_value = {
+            symbol: base.snapshot for symbol in symbols
+        }
+        scanner = DeepSignalScanner(
+            provider,
+            RecordingGemini(),
+            symbols,
+            min_score=0,
+            max_per_scan=99,
+            max_workers=2,
+        )
+        with patch.object(scanner, "_fundamental_ceiling", return_value=100), patch.object(
+            scanner,
+            "_evaluate",
+            side_effect=lambda symbol, snapshot, macro: candidates[symbol],
+        ):
+            ranked = scanner.find_candidates()
+
+        self.assertEqual(len(ranked), 4)
+        self.assertEqual([item.symbol for item in ranked], ["DDD", "CCC", "BBB", "AAA"])
+        self.assertEqual(scanner.max_per_scan, 3)
 
     def test_scanner_rejects_undated_or_stale_history(self):
         signal = signal_fixture()

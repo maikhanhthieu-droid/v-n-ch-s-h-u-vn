@@ -18,7 +18,7 @@ permissions:
 
 concurrency:
   group: vn-equity-telegram-bot-session
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   bot-session:
@@ -54,12 +54,25 @@ jobs:
       - name: Validate required secrets
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_ALLOWED_CHAT_IDS: ${{ secrets.TELEGRAM_ALLOWED_CHAT_IDS || secrets.TELEGRAM_CHAT_ID }}
         run: |
           python - <<'PY'
           import os
           if not os.environ.get("TELEGRAM_BOT_TOKEN", "").strip():
               raise SystemExit("Missing TELEGRAM_BOT_TOKEN Actions secret")
-          print("Required Telegram secret is configured.")
+          raw_chat_ids = os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "")
+          chat_ids = [item.strip() for item in raw_chat_ids.split(",") if item.strip()]
+          if not chat_ids:
+              raise SystemExit(
+                  "Missing TELEGRAM_ALLOWED_CHAT_IDS or fallback TELEGRAM_CHAT_ID Actions secret"
+              )
+          try:
+              [int(item) for item in chat_ids]
+          except ValueError as exc:
+              raise SystemExit(
+                  "Telegram allowed chat IDs must be comma-separated integers"
+              ) from exc
+          print("Telegram token and chat allowlist are configured.")
           PY
 
       - name: Run Telegram bot session
@@ -70,12 +83,19 @@ jobs:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           VNSTOCK_API_KEY: ${{ secrets.VNSTOCK_API_KEY }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_ALLOWED_CHAT_IDS: ${{ secrets.TELEGRAM_ALLOWED_CHAT_IDS || secrets.TELEGRAM_CHAT_ID }}
           DATA_DIR: data
           GEMINI_GOOGLE_SEARCH: ${{ vars.GEMINI_GOOGLE_SEARCH || 'false' }}
           MODEL_COUNCIL_ENABLED: ${{ vars.MODEL_COUNCIL_ENABLED || 'true' }}
           GLM_MODEL: "glm-5.2"
           DEEPSEEK_MODEL: "deepseek-v4-flash"
-          MODEL_COUNCIL_DAILY_BUDGET: "4"
+          GEMINI_DAILY_BUDGET: "6"
+          DEEP_DAILY_LIMIT: "3"
+          SCAN_DAILY_LIMIT: "1"
+          DAILY_SHORTLIST_LIMIT: "3"
+          MAX_SIGNALS_PER_SCAN: "3"
+          MODEL_COUNCIL_DAILY_BUDGET: "3"
+          MODEL_COUNCIL_ERROR_COOLDOWN: "900"
           RESEARCH_COMMAND_COOLDOWN: "60"
           SCAN_WORKERS: "2"
           SIGNAL_REQUIRE_BACKTEST: "true"

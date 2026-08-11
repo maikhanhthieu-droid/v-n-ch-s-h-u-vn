@@ -28,6 +28,7 @@ from bot import (  # noqa: E402
     WatchlistStore,
     YahooQuoteProvider,
     _vnstock_bars,
+    _format_council_shadow,
     backtest_similar_patterns,
     build_deep_signal,
     build_score_breakdown,
@@ -43,6 +44,7 @@ from bot import (  # noqa: E402
     normalize_symbol,
     yahoo_symbol,
 )
+from model_council import AnalystOpinion, AnalystReview, CouncilReport  # noqa: E402
 
 
 class FakeProvider:
@@ -472,6 +474,17 @@ class BotTests(unittest.TestCase):
     def test_gemini_accepts_rounded_input_but_rejects_non_neutral_labels(self):
         analyzer = GeminiAnalyzer("")
         analyzer._validate_numeric_claims("ROE 1.53%.", "ROE: 1.52691842223751%.")
+        analyzer._validate_numeric_claims(
+            "Dữ kiện đã kiểm chứng: doanh thu tăng 27.4%.",
+            "Dữ liệu định lượng có giá 20.",
+            allow_grounded_updates=True,
+        )
+        with self.assertRaisesRegex(RuntimeError, "numeric claim"):
+            analyzer._validate_numeric_claims(
+                "Điểm tổng bị sửa thành 91/100.",
+                "Điểm tổng: 80/100.",
+                allow_grounded_updates=True,
+            )
         with self.assertRaisesRegex(RuntimeError, "non-neutral"):
             analyzer._validate_neutral_language(
                 "P/B hấp dẫn và cấu trúc tài chính lành mạnh."
@@ -747,7 +760,7 @@ class BotTests(unittest.TestCase):
             )
             self.assertEqual(app.handle_text("/deep FPT", 1), "deep result")
             blocked = app.handle_text("/scan", 1)
-            self.assertIn("chỉ chạy một lần mỗi phút", blocked)
+            self.assertIn("thời gian nghỉ", blocked)
             self.assertEqual(app.handle_text("/ping", 1), "pong ✅")
             provider.get_quote.assert_called_once()
             scanner.find_candidates.assert_not_called()
@@ -783,6 +796,151 @@ class BotTests(unittest.TestCase):
             usage_text = app.handle_text("/usage", 1)
             self.assertIn("/deep: 1/1", usage_text)
             self.assertIn("/scan: 1/1", usage_text)
+
+    def test_scan_is_quant_only_and_caps_fresh_daily_shortlist_at_three(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = SignalStore(Path(directory) / "signals.json")
+
+            def candidate(symbol, score):
+                quote = Quote(symbol, symbol, 100.0, 99.0)
+                snapshot = FundamentalSnapshot(symbol, f"{symbol} Corp")
+                return DeepSignal(symbol, score, snapshot, quote, [], ["đạt gate sơ bộ"])
+
+            scanner = Mock()
+            scanner.find_candidates.return_value = [
+                candidate("AAA", 95),
+                candidate("BBB", 94),
+                candidate("CCC", 93),
+                candidate("DDD", 92),
+                candidate("EEE", 91),
+                candidate("FFF", 90),
+            ]
+            scanner.render_signal.side_effect = AssertionError("scan must not call AI renderer")
+            usage = ApiUsageStore(Path(directory) / "usage.json", scan_daily_limit=1)
+            app = BotApplication(
+                telegram=Mock(),
+                provider=Mock(),
+                store=WatchlistStore(Path(directory) / "watchlists.json"),
+                signal_store=state,
+                scanner=scanner,
+                usage_store=usage,
+                daily_shortlist_limit=3,
+                research_command_cooldown=0,
+            )
+
+            rendered = app.handle_text("/scan", 1)
+
+            self.assertIn("0 lượt gọi AI", rendered)
+            self.assertIn("AAA", rendered)
+            self.assertIn("BBB", rendered)
+            self.assertIn("CCC", rendered)
+            self.assertNotIn("DDD Corp", rendered)
+            scanner.render_signal.assert_not_called()
+            saved = state.shortlist(ApiUsageStore._today())
+            self.assertEqual([item["symbol"] for item in saved], ["AAA", "BBB", "CCC"])
+            snapshot = usage.snapshot()
+            self.assertEqual(snapshot["gemini_requests"]["used"], 0)
+            self.assertEqual(snapshot["council_reviews"]["used"], 0)
+
+    def test_scheduled_scan_sends_one_quant_shortlist_without_ai(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = SignalStore(Path(directory) / "signals.json")
+            state.subscribe("7")
+            signal = DeepSignal(
+                "FPT",
+                88,
+                FundamentalSnapshot("FPT", "FPT Corp"),
+                Quote("FPT", "FPT Corp", 100.0, 99.0),
+                [],
+                ["đạt gate sơ bộ"],
+            )
+            scanner = Mock()
+            scanner.find_candidates.return_value = [signal]
+            scanner.render_signal.side_effect = AssertionError("scheduled scan touched AI")
+            telegram = Mock()
+            app = BotApplication(
+                telegram=telegram,
+                provider=Mock(),
+                store=WatchlistStore(Path(directory) / "watchlists.json"),
+                signal_store=state,
+                scanner=scanner,
+                research_command_cooldown=0,
+            )
+
+            self.assertIsNone(app.run_signal_scan(manual=False))
+
+            scanner.render_signal.assert_not_called()
+            telegram.send_message.assert_called_once()
+            self.assertIn("0 lượt gọi AI", telegram.send_message.call_args.args[1])
+
+    def test_deep_records_once_only_for_todays_shortlist(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = SignalStore(Path(directory) / "signals.json")
+            state.save_shortlist(ApiUsageStore._today(), [{"symbol": "FPT"}])
+            provider = Mock()
+            provider.get_quote.return_value = Quote("FPT", "FPT", 100.0, 99.0)
+            provider.get_history.return_value = []
+            provider.get_fundamentals.return_value = FundamentalSnapshot("FPT", "FPT")
+            scanner = Mock()
+            scanner.render_signal.return_value = "deep result"
+            scanner.backtest_cost_pct = 0.45
+            ledger = Mock()
+            app = BotApplication(
+                telegram=Mock(),
+                provider=provider,
+                store=WatchlistStore(Path(directory) / "watchlists.json"),
+                signal_store=state,
+                scanner=scanner,
+                outcome_ledger=ledger,
+                research_command_cooldown=0,
+            )
+
+            self.assertEqual(app.handle_text("/deep FPT", 1), "deep result")
+            self.assertEqual(app.handle_text("/deep FPT", 1), "deep result")
+
+            self.assertEqual(ledger.record_signal.call_count, 1)
+
+    def test_unknown_chat_is_silently_blocked_before_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            telegram = Mock()
+            app = BotApplication(
+                telegram=telegram,
+                provider=Mock(),
+                store=WatchlistStore(Path(directory) / "watchlists.json"),
+                allowed_chat_ids={"1"},
+            )
+            app.handle_update({"message": {"chat": {"id": 2}, "text": "/ping"}})
+            telegram.send_message.assert_not_called()
+            app.handle_update({"message": {"chat": {"id": 1}, "text": "/ping"}})
+            telegram.send_message.assert_called_once_with(1, "pong ✅")
+
+    def test_council_billing_error_is_actionable_and_never_shows_zero_confidence(self):
+        billing = AnalystReview(
+            provider="glm",
+            model="glm-test",
+            status="error",
+            opinion=AnalystOpinion.abstain("provider_billing"),
+            failure_kind="billing",
+            retry_after_seconds=900,
+        )
+        missing = AnalystReview(
+            provider="deepseek",
+            model="deepseek-test",
+            status="disabled",
+            opinion=AnalystOpinion.abstain("provider_not_configured"),
+        )
+        rendered = _format_council_shadow(
+            CouncilReport(
+                enabled=True,
+                status="unavailable",
+                fingerprint="test",
+                cache_hit=False,
+                reviews=(billing, missing),
+            )
+        )
+        self.assertIn("hết số dư", rendered)
+        self.assertIn("chưa cấu hình API key", rendered)
+        self.assertNotIn("0%", rendered)
 
     def test_news_command_uses_sources_macro_and_daily_counter(self):
         with tempfile.TemporaryDirectory() as directory:
