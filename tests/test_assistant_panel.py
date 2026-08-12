@@ -13,6 +13,47 @@ from bot import (
 
 
 class AssistantPanelTests(TestCase):
+    def test_web_first_provider_aliases_are_persisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = AssistantConversationStore(Path(directory) / "conversations.json")
+            store.start_question(7, "Kiểm tra cấu trúc cũ")
+
+            session = store.add_response(7, "duck", "Bối cảnh hiện tại cần xác minh thêm.")
+
+            self.assertIn("duckai", session["responses"])
+            self.assertEqual(session["topic"], "Kiểm tra cấu trúc cũ")
+
+    def test_general_bridge_collects_rss_context_and_gemini_view(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = AssistantConversationStore(Path(directory) / "conversations.json")
+            news = Mock()
+            news.headlines.return_value = []
+            analyzer = Mock()
+            analyzer.enabled.return_value = True
+            analyzer.answer_question.return_value = "KẾT LUẬN: cần kiểm tra thêm nguồn gốc."
+            scanner = Mock()
+            scanner.gemini = analyzer
+            app = BotApplication(
+                telegram=Mock(),
+                provider=Mock(),
+                store=WatchlistStore(Path(directory) / "watchlists.json"),
+                scanner=scanner,
+                news_service=news,
+                conversation_store=store,
+                research_command_cooldown=0,
+            )
+
+            result = app.handle_text("/ask phân tích cấu trúc cũ", 7)
+
+            self.assertIn("Poe", result)
+            self.assertIn("Duck.ai", result)
+            self.assertIn("GPT", result)
+            self.assertIn("Gemini", result)
+            analyzer.answer_question.assert_called_once()
+            session = store.get(7)
+            self.assertEqual(session["question"], "phân tích cấu trúc cũ")
+            self.assertIn("gemini", session["responses"])
+
     def test_store_persists_and_caps_response_at_eighty_words(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "conversations.json"

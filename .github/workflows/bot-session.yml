@@ -89,6 +89,7 @@ jobs:
           TELEGRAM_ALLOWED_CHAT_IDS: ${{ secrets.TELEGRAM_ALLOWED_CHAT_IDS || secrets.TELEGRAM_CHAT_ID }}
           DATA_DIR: data
           GEMINI_GOOGLE_SEARCH: ${{ vars.GEMINI_GOOGLE_SEARCH || 'false' }}
+          GEMINI_BRIDGE_SEARCH: ${{ vars.GEMINI_BRIDGE_SEARCH || 'false' }}
           MODEL_COUNCIL_ENABLED: ${{ vars.MODEL_COUNCIL_ENABLED || 'true' }}
           MODEL_COUNCIL_FREE_FIRST: ${{ vars.MODEL_COUNCIL_FREE_FIRST || 'true' }}
           OPENROUTER_FREE_MODEL: ${{ vars.OPENROUTER_FREE_MODEL || 'openrouter/free' }}

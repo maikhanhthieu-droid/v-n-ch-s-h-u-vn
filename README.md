@@ -17,6 +17,11 @@ DeepSeek là các lớp nghiên cứu tùy chọn, không được quyền sửa
   Nếu một trợ lý hết quota hoặc lỗi, bot giữ các góc nhìn đã nhận và tự mở panel
   Telegram cho đúng mã để bạn chỉ bổ sung trợ lý còn thiếu bằng `/ai_add`.
   Ba lớp AI chỉ diễn giải evidence, không sửa điểm 100, target/stop hay backtest
+- `/ask câu hỏi` hoặc `/bridge câu hỏi`: cầu nối Telegram cho Poe, Duck.ai,
+  ChatGPT, Coze và Gemini; Gemini lấy thêm tiêu đề hiện tại từ RSS, còn các web AI
+  được hỏi bán tự động bằng prompt/copy-paste để không lưu cookie đăng nhập
+- `/panel FPT`, `/ai_prompt poe`, `/ai_add poe ...`, `/ai_summary`: cùng một phiên
+  hội đồng, hỗ trợ cả góc nhìn hiện tại và phân tích cấu trúc cũ
 - `/news FPT` hoặc `/news Thông tư 14/2026`: phân tích tiêu đề theo hai chiều,
   luôn gắn nguồn và nêu phần chưa thể xác nhận
 - `/new FPT`: bí danh ngắn của `/news FPT`; khi đầu vào là một mã, bot lấy thêm
@@ -44,6 +49,9 @@ rơi về Yahoo. Dữ liệu có thể trễ, thiếu hoặc không khả dụng
 khuyến nghị đầu tư.
 
 ## Chạy cục bộ
+
+Thiết lập GitHub Actions và luồng cầu nối đa AI xem tại
+[`SETUP_MULTI_AI.md`](SETUP_MULTI_AI.md).
 
 1. Vào `@BotFather`, thu hồi token đã từng được đăng trong chat và tạo token mới.
 2. Tạo môi trường riêng và cài thư viện:
@@ -145,6 +153,9 @@ Biến cấu hình:
 - `GEMINI_THINKING_LEVEL`: mặc định `minimal`
 - `GEMINI_MAX_OUTPUT_TOKENS`: mặc định `1000`
 - `GEMINI_GOOGLE_SEARCH`: mặc định `false`; chỉ bật khi project có đủ quota grounding
+- `GEMINI_BRIDGE_SEARCH`: mặc định `false`; bật riêng cho `/ask` nếu muốn Gemini
+  tự dùng Google Search grounding; đường miễn phí an toàn vẫn dùng RSS + dữ liệu
+  được bot thu thập trước
 - `GEMINI_TIMEOUT`: mặc định `30` giây
 - `GEMINI_MIN_INTERVAL`: tối thiểu `60` giây giữa hai yêu cầu Gemini; bot trả
   thông báo cooldown ngay thay vì đứng chờ

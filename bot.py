@@ -2002,7 +2002,17 @@ class SignalStore:
 class AssistantConversationStore:
     """Persist one Telegram-owned multi-assistant conversation per chat."""
 
-    PROVIDERS = ("deepseek", "glm", "gpt", "gemini")
+    # Web-first providers are intentionally kept in this store.  The bot never
+    # stores browser cookies or attempts to automate a provider's login flow;
+    # the user opens the link, authenticates if needed, and pastes the answer
+    # back with /ai_add.
+    PROVIDERS = ("poe", "duckai", "gpt", "gemini", "coze", "deepseek", "glm")
+    PROVIDER_ALIASES = {
+        "duck": "duckai",
+        "duckduckgo": "duckai",
+        "duck.ai": "duckai",
+        "chatgpt": "gpt",
+    }
 
     def __init__(self, path: Path):
         self.path = path
@@ -2040,6 +2050,33 @@ class AssistantConversationStore:
     def start(self, chat_id: str | int, symbol: str, evidence: str) -> dict[str, Any]:
         session = {
             "symbol": normalize_symbol(symbol),
+            "topic": normalize_symbol(symbol),
+            "question": f"Phân tích {normalize_symbol(symbol)} theo dữ liệu quant đã cung cấp.",
+            "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "evidence": str(evidence)[:7000],
+            "responses": {},
+            "summary": "",
+        }
+        with self._lock:
+            self._data[str(chat_id)] = session
+            self._save_locked()
+        return dict(session)
+
+    def start_question(
+        self,
+        chat_id: str | int,
+        question: str,
+        evidence: str = "",
+    ) -> dict[str, Any]:
+        """Start a general multi-AI session without requiring a stock symbol."""
+
+        clean_question = re.sub(r"\s+", " ", str(question)).strip()[:4000]
+        if not clean_question:
+            raise ValueError("Câu hỏi không được để trống.")
+        session = {
+            "symbol": "GENERAL",
+            "topic": clean_question[:180],
+            "question": clean_question,
             "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "evidence": str(evidence)[:7000],
             "responses": {},
@@ -2063,8 +2100,11 @@ class AssistantConversationStore:
         max_words: int = DEFAULT_AI_PANEL_MAX_WORDS,
     ) -> dict[str, Any]:
         normalized = str(provider).strip().lower()
+        normalized = self.PROVIDER_ALIASES.get(normalized, normalized)
         if normalized not in self.PROVIDERS:
-            raise ValueError("Trợ lý phải là deepseek, glm, gpt hoặc gemini.")
+            raise ValueError(
+                "Trợ lý phải là poe, duckai, gpt, gemini, coze, deepseek hoặc glm."
+            )
         words = str(response).strip().split()
         if not words:
             raise ValueError("Phản hồi trợ lý đang trống.")
@@ -2619,6 +2659,8 @@ class GeminiAnalyzer:
         use_search: bool | None = None,
         model: str | None = None,
         bypass_min_interval: bool = False,
+        validate_numeric_claims: bool = True,
+        validate_neutral_language: bool = True,
     ) -> str:
         self._reserve_request_slot(bypass_min_interval=bypass_min_interval)
         client = self._create_client()
@@ -2641,12 +2683,14 @@ class GeminiAnalyzer:
             raise RuntimeError("Gemini không trả về nội dung")
         if use_search and not sources:
             raise RuntimeError("Gemini Search returned no grounding sources")
-        self._validate_numeric_claims(
-            text,
-            prompt,
-            allow_grounded_updates=bool(use_search and sources),
-        )
-        self._validate_neutral_language(text)
+        if validate_numeric_claims:
+            self._validate_numeric_claims(
+                text,
+                prompt,
+                allow_grounded_updates=bool(use_search and sources),
+            )
+        if validate_neutral_language:
+            self._validate_neutral_language(text)
         return self._with_sources(text, sources)
 
     def _analyze_legacy_fallback(
@@ -2826,6 +2870,70 @@ class GeminiAnalyzer:
                 self._open_quota_circuit()
                 return self._quota_message()
             return "Gemini tạm thời không tổng hợp được; các góc nhìn đã được giữ trong phiên Telegram."
+
+    def answer_question(
+        self,
+        question: str,
+        evidence: str = "",
+        use_search: bool | None = None,
+    ) -> str:
+        """Answer a general bridge question, optionally grounded by Google Search.
+
+        The default path uses only the public evidence collected by the bot (for
+        example current RSS headlines).  Search grounding is opt-in because
+        Google documents it as a separately metered feature for current Gemini
+        models and it may not be available on the free API tier.
+        """
+
+        if not self.enabled():
+            return "Gemini chưa có API key; hãy dùng các link web trong panel."
+        clean_question = re.sub(r"\s+", " ", str(question)).strip()[:4000]
+        if not clean_question:
+            return "Gemini không nhận được câu hỏi."
+        search_requested = self.use_google_search if use_search is None else bool(use_search)
+        search_allowed = search_requested and time.monotonic() >= self._search_disabled_until
+        prompt = (
+            "Bạn là Gemini trong một hội đồng trợ lý đa AI. Trả lời bằng tiếng Việt, "
+            "phân biệt rõ dữ kiện, suy luận và phần chưa xác minh. Nếu có nguồn công khai "
+            "bên dưới, chỉ dùng chúng để nói về thông tin hiện tại; không giả vờ đã đọc "
+            "toàn văn bài viết. Không bịa số liệu, không đưa lời khuyên pháp lý/y tế/tài chính "
+            "chắc chắn. Câu hỏi của người dùng:\n"
+            f"{clean_question}\n\n"
+            "Dữ liệu công khai hiện có:\n"
+            f"{str(evidence or '- Chưa có dữ liệu hiện tại.')[:6500]}\n\n"
+            "Hãy trả lời ngắn gọn theo 4 phần: KẾT LUẬN; DỮ KIỆN; ĐIỂM CHƯA CHẮC; "
+            "BƯỚC KIỂM TRA TIẾP THEO."
+        )
+        cache_key = self._prompt_cache_key("BRIDGE", prompt, search_allowed)
+        cached = self._cached_result(cache_key)
+        if cached is not None:
+            return cached + "\n(Kết quả Gemini lấy từ cache để tiết kiệm quota.)"
+        if self._quota_remaining() > 0:
+            return self._quota_message()
+        try:
+            result = self._analyze_interactions(
+                prompt,
+                use_search=search_allowed,
+                bypass_min_interval=True,
+                validate_numeric_claims=False,
+                validate_neutral_language=False,
+            )
+            self._store_cached_result(cache_key, result)
+            return result
+        except GeminiRequestCooldown as exc:
+            return self._rate_message(exc.remaining)
+        except GeminiDailyBudgetReached:
+            return self._daily_budget_message()
+        except GeminiQuotaCircuitOpen:
+            return self._quota_message()
+        except Exception as exc:
+            LOG.warning("Gemini bridge answer failed safely: %s", type(exc).__name__)
+            if search_allowed:
+                self._search_disabled_until = time.monotonic() + 3600.0
+            if self._is_quota_error(exc):
+                self._open_quota_circuit()
+                return self._quota_message()
+            return "Gemini chưa trả lời được; các nguồn web vẫn có thể được hỏi trong panel."
 
     def analyze_news(
         self,
@@ -4542,6 +4650,8 @@ WELCOME = (
 HELP = (
     "<b>Bàn trợ lý web</b>\n"
     "/panel <code>FPT</code> — tạo prompt chung và link mở các AI\n"
+    "/ask <code>câu hỏi</code> — cầu nối Poe/Duck.ai/GPT/Coze + Gemini\n"
+    "/bridge <code>câu hỏi</code> — bí danh của /ask\n"
     "/ai_add <code>deepseek nội_dung</code> — đưa phản hồi web về Telegram\n"
     "/ai_prompt <code>glm</code> — tạo prompt có các ý kiến trước\n"
     "/ai_summary — Gemini tổng hợp; /ai_status — xem phiên\n\n"
@@ -4835,33 +4945,74 @@ class BotApplication:
             for name, text in responses.items()
             if isinstance(text, str) and text.strip()
         ) or "- Chưa có góc nhìn trợ lý nào."
-        return (
-            f"Bạn là {target}, trợ lý nghiên cứu trung lập. Đọc dữ liệu quant và ý kiến trước; "
+        normalized_target = str(target or "trợ lý").strip().lower()
+        role_instructions = {
+            "poe": (
+                "Phản biện độc lập bằng cách so sánh nhiều giả thuyết; nêu rõ điểm đồng thuận "
+                "và điểm mâu thuẫn."
+            ),
+            "duckai": (
+                "Kiểm tra bối cảnh hiện tại và cách diễn giải dễ hiểu; đánh dấu điều gì cần "
+                "mở nguồn gốc để xác minh."
+            ),
+            "gpt": (
+                "Phân tích cấu trúc cũ, tìm phần còn thiếu hoặc mâu thuẫn, rồi đề xuất cách "
+                "sắp xếp lại mà không tự bịa dữ kiện."
+            ),
+            "gemini": (
+                "Đối chiếu dữ liệu hiện tại và nguồn đã cung cấp; phân biệt dữ kiện với suy luận."
+            ),
+            "coze": "Đề xuất quy trình/giải pháp có cấu trúc và nêu giả định rõ ràng.",
+        }.get(normalized_target, "Đọc dữ liệu quant và ý kiến trước với thái độ trung lập.")
+        question = str(
+            session.get("question")
+            or f"Phân tích {session.get('topic') or session.get('symbol') or 'chủ đề này'}."
+        )
+        is_general = str(session.get("symbol") or "").upper() == "GENERAL"
+        format_instruction = (
+            "Trả lời 40-80 từ theo đúng 5 mục: KẾT LUẬN; DỮ KIỆN; GIẢ ĐỊNH; "
+            "ĐIỂM CHƯA CHẮC; BƯỚC TIẾP THEO."
+            if is_general
+            else
             "trả lời 40-80 từ theo đúng 5 dòng: TRẠNG THÁI; VÙNG MUA; VÙNG BÁN/CHỐT LỜI; "
             "STOP; CẢNH BÁO/XÚC TÁC. Vùng mua chỉ được nằm trong vùng vào quant; vùng bán "
             "chỉ dùng T1/T2/T3. Nếu chưa đủ điều kiện thì ghi CHƯA MUA. Không sửa score, "
-            "target hay stop; không gọi hit-rate là xác suất thắng.\n"
+            "target hay stop; không gọi hit-rate là xác suất thắng."
+        )
+        return (
+            f"Bạn là {target}, trợ lý nghiên cứu trung lập. {role_instructions} "
+            + format_instruction
+            + "\n"
+            f"Câu hỏi/chủ đề: {question}\n\n"
             f"{session.get('evidence', '')}\nÝ kiến trước:\n{prior}"
         )
 
     @staticmethod
     def _panel_view(session: dict[str, Any]) -> str:
         labels = {
+            "poe": "Poe",
+            "duckai": "Duck.ai",
             "deepseek": "DeepSeek",
             "glm": "GLM",
             "gpt": "GPT",
             "gemini": "Gemini",
+            "coze": "Coze",
         }
         links = {
+            "poe": "https://poe.com/",
+            "duckai": "https://duck.ai/",
             "deepseek": "https://chat.deepseek.com/",
             "glm": "https://chat.z.ai/",
             "gpt": "https://chatgpt.com/",
             "gemini": "https://gemini.google.com/app",
+            "coze": "https://www.coze.com/",
         }
         responses = session.get("responses", {})
+        subject = str(session.get("topic") or session.get("symbol") or "")
         lines = [
-            f"<b>{html.escape(str(session.get('symbol', ''))) } — BÀN TRỢ LÝ AI</b>",
+            f"<b>{html.escape(subject)} — BÀN TRỢ LÝ AI</b>",
             "Telegram giữ dữ liệu chung; web AI không tự đọc được phiên này.",
+            "Mở link, xác thực/gửi thủ công nếu cần, rồi dùng /ai_add. Bot không lưu cookie.",
             "",
         ]
         for provider in AssistantConversationStore.PROVIDERS:
@@ -4875,8 +5026,8 @@ class BotApplication:
         lines.extend(
             [
                 "",
-                "Dán về: <code>/ai_add deepseek nội_dung</code> (hoặc glm/gpt/gemini)",
-                "Lấy prompt mới: <code>/ai_prompt deepseek</code>",
+                "Dán về: <code>/ai_add poe nội_dung</code> (hoặc duckai/gpt/gemini/coze)",
+                "Lấy prompt mới: <code>/ai_prompt poe</code>",
                 "Tổng hợp: <code>/ai_summary</code> · Xem lại: <code>/ai_status</code>",
             ]
         )
@@ -4938,6 +5089,63 @@ class BotApplication:
             backtest_cost_pct=float(scanner_cost),
         )
         return self._start_assistant_panel_from_signal(chat_id, signal)
+
+    def _start_general_panel(self, chat_id: int | str, question: str) -> str:
+        """Start a web-first AI bridge for a free-form question."""
+
+        if self.conversation_store is None:
+            return "Bàn trợ lý chưa được cấu hình."
+        clean_question = re.sub(r"\s+", " ", question).strip()[:4000]
+        if not clean_question:
+            return "Dùng: /ask <câu hỏi>"
+
+        evidence_lines = [f"Câu hỏi: {clean_question}"]
+        if self.news_service is not None:
+            try:
+                headlines = self.news_service.headlines(clean_question)
+            except (BotError, ValueError, TypeError) as exc:
+                LOG.info("Bridge headlines unavailable: %s", type(exc).__name__)
+                headlines = []
+            if headlines:
+                evidence_lines.append("Tin công khai mới tìm được từ RSS:")
+                evidence_lines.extend(
+                    f"- [{item.source}] {item.title} ({item.published_at or 'chưa rõ ngày'}; {item.url})"
+                    for item in headlines
+                )
+            else:
+                evidence_lines.append("- Chưa có tiêu đề công khai phù hợp từ RSS.")
+        else:
+            evidence_lines.append("- Chưa cấu hình nguồn RSS.")
+        evidence = "\n".join(evidence_lines)
+        self.conversation_store.start_question(chat_id, clean_question, evidence)
+
+        analyzer = (
+            self.scanner.gemini
+            if self.scanner is not None and getattr(self.scanner, "gemini", None) is not None
+            else build_gemini_analyzer(self.usage_store)
+        )
+        if callable(getattr(analyzer, "enabled", None)) and analyzer.enabled():
+            try:
+                gemini_view = analyzer.answer_question(
+                    clean_question,
+                    evidence,
+                    use_search=parse_bool(
+                        os.environ.get("GEMINI_BRIDGE_SEARCH"),
+                        False,
+                    ),
+                )
+                if isinstance(gemini_view, str) and gemini_view.strip():
+                    self.conversation_store.add_response(chat_id, "gemini", gemini_view)
+            except (BotError, ValueError, TypeError, RuntimeError) as exc:
+                LOG.info("Gemini bridge view unavailable: %s", type(exc).__name__)
+
+        session = self.conversation_store.get(chat_id) or {}
+        return (
+            self._panel_view(session)
+            + "\n\n<b>Prompt đầu tiên</b>\n<pre>"
+            + html.escape(self._panel_prompt(session, "poe")[:2600])
+            + "</pre>"
+        )
 
     def handle_update(self, update: dict[str, Any]) -> None:
         message = update.get("message") if isinstance(update, dict) else None
@@ -5052,6 +5260,14 @@ class BotApplication:
                     return "Dùng: /ta <mã>, ví dụ /ta FPT"
                 symbol = normalize_symbol(argument.split()[0])
                 return format_ta(symbol, self.provider.get_history(symbol))
+            if command in {"/ask", "/bridge", "/multi"}:
+                argument = _argument(text)
+                if not argument:
+                    return "Dùng: /ask <câu hỏi>, ví dụ /ask phân tích cấu trúc cũ của kế hoạch này"
+                remaining = self._claim_research_slot()
+                if remaining:
+                    return self._research_cooldown_message(remaining)
+                return self._start_general_panel(chat_id, argument)
             if command == "/panel":
                 argument = _argument(text)
                 if not argument:
@@ -5075,7 +5291,7 @@ class BotApplication:
                 argument = _argument(text)
                 provider_name = (argument or "trợ lý").split()[0].lower()
                 if provider_name not in (*AssistantConversationStore.PROVIDERS, "trợ lý"):
-                    return "Dùng: /ai_prompt deepseek (hoặc glm/gpt/gemini)"
+                    return "Dùng: /ai_prompt poe (hoặc duckai/gpt/gemini/coze)"
                 session = self.conversation_store.get(chat_id)
                 if session is None:
                     return "Chưa có phiên. Dùng /panel <mã> trước."
@@ -5087,7 +5303,7 @@ class BotApplication:
                     return "Bàn trợ lý chưa được cấu hình."
                 argument = _argument(text)
                 if not argument or len(argument.split(maxsplit=1)) < 2:
-                    return "Dùng: /ai_add deepseek <câu trả lời>"
+                    return "Dùng: /ai_add poe <câu trả lời>"
                 provider_name, response = argument.split(maxsplit=1)
                 session = self.conversation_store.add_response(
                     chat_id,
